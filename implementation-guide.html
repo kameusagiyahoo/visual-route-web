@@ -1,0 +1,38 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Visual Route Web版 実装手順書</title><style>
+:root{color-scheme:dark;--bg:#0b1018;--panel:#131b27;--line:#2a3648;--text:#f2f5fa;--muted:#9ba8ba;--accent:#4d91ff;--warn:#efb85e;--good:#65c77d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic",sans-serif;line-height:1.7}main{max-width:900px;margin:auto;padding:24px 16px 70px}h1{font-size:29px;margin:0 0 8px}h2{margin-top:38px;border-bottom:1px solid var(--line);padding-bottom:8px}p,li{color:#c8d1de}.muted{color:var(--muted)}.note{border-left:4px solid var(--accent);background:#111b2a;border-radius:8px;padding:12px 14px;margin:14px 0}.warn{border-left-color:var(--warn);background:#211c12}.good{border-left-color:var(--good);background:#102018}.step{display:grid;grid-template-columns:36px 1fr;gap:10px;margin:15px 0}.num{width:31px;height:31px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-weight:800}code{background:#090e15;padding:2px 5px;border-radius:5px}table{border-collapse:collapse;width:100%;background:var(--panel);margin:12px 0}th,td{border:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}th{background:#182231}a{color:#86b6ff}.flow{overflow:auto;background:#0e151f;border:1px solid var(--line);border-radius:12px;padding:14px;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfd9e8}
+</style></head><body><main>
+<h1>Visual Route Lab — Web版 実装手順書</h1><p class="muted">iPhone 15 / Safari / Macなし / Xcodeなし / Expoなし / npmなし</p>
+<div class="note good"><strong>今回の方式</strong><br>静的HTML/JavaScriptをGitHub Pagesに置き、iPhoneのSafariだけで実行します。</div>
+<h2>1. 重要</h2><div class="note warn"><strong>index.htmlのファイル直開きでは完成版として使いません。</strong><br>カメラを使うためGitHub PagesのHTTPS URLからSafariで開きます。</div>
+<table><tr><th>必要</th><th>不要</th></tr><tr><td>iPhone<br>Safari<br>GitHubアカウント</td><td>Expo Go<br>Mac<br>Xcode<br>Developer Program<br>Node.js/npm<br>PC</td></tr></table>
+<h2>2. ZIPを展開</h2><div class="step"><div class="num">1</div><div>ChatGPTから <code>visual-route-web.zip</code> を「ファイル」に保存。</div></div><div class="step"><div class="num">2</div><div>ZIPをタップして展開。</div></div><div class="flow">visual-route-web/
+├── index.html
+├── README.md
+├── implementation-guide.html
+└── TEST_CHECKLIST.md</div>
+<h2>3. iPhoneだけでGitHub Repositoryを作る</h2><div class="step"><div class="num">1</div><div>Safariで <a href="https://github.com/">github.com</a> を開いてログイン。</div></div><div class="step"><div class="num">2</div><div>New repositoryを作成。例: <code>visual-route-web</code></div></div><div class="step"><div class="num">3</div><div>最短で試すならPublic repositoryで作成。</div></div>
+<h2>4. ファイルをアップロード</h2><p>Repositoryを開き、<strong>Add file → Upload files</strong> 相当の操作から、展開した4ファイルを選択してCommitします。</p><div class="note">モバイル画面で項目が見つからない場合は、Safariの「ぁあ」メニューから<strong>デスクトップ用Webサイトを表示</strong>にすると見つけやすくなることがあります。</div>
+<h2>5. GitHub PagesをON</h2><div class="step"><div class="num">1</div><div>Repository → <strong>Settings</strong>。</div></div><div class="step"><div class="num">2</div><div><strong>Pages</strong>。</div></div><div class="step"><div class="num">3</div><div>Build and deployment → Source = <strong>Deploy from a branch</strong>。</div></div><div class="step"><div class="num">4</div><div>Branch = <strong>main</strong>、Folder = <strong>/(root)</strong> → Save。</div></div><div class="step"><div class="num">5</div><div>Pages画面に出た公開URLをSafariで開く。</div></div>
+<h2>6. 初回起動</h2><ol><li><strong>① センサーを許可</strong>を押す。</li><li>iOSのモーション/画面の向きの許可を承認。</li><li>iPhoneを回して方角が変わることを確認。</li><li>上下に軽く動かして動的加速度が変わることを確認。</li></ol><p>iOS SafariではDeviceMotion / DeviceOrientationの許可要求をユーザー操作から行う必要があります。アプリはこの方式で実装済みです。</p>
+<h2>7. 歩数検出を合わせる</h2><div class="flow">加速度
+  ↓
+重力のゆっくりした成分を除く
+  ↓
+しきい値を超えたピーク
+  ↓
+推定1歩</div><p>実際に10歩歩いて調整します。</p><ul><li>10歩→15歩: しきい値を上げる</li><li>10歩→6歩: しきい値を下げる</li><li>初期値: 1.10 m/s²</li></ul>
+<h2>8. ルート登録</h2><ol><li>ルート名を入力。</li><li>START。</li><li>普段に近い持ち方で歩く。</li><li>曲がり角・ドア・固定棚などで「現在地点を写真で記録」。</li><li>GOALでSTOP。</li></ol>
+<h2>9. 再走行</h2><ol><li>ナビタブでルート選択。</li><li>基本テストでは登録時と同じSTART地点。</li><li>ナビ開始。</li><li>同じルートを歩き、進捗%を見る。</li></ol>
+<h2>10. 画像補正</h2><p>AIモデルなしで、8×8の明るさ配置とRGBヒストグラムを比較します。</p><div class="flow">現在画像
+  ↓
+軽量画像特徴
+  ↓
+登録写真と比較
+  ↓
+最も似た「○歩地点」
+  ↓
+歩数位置を補正</div><div class="note warn">同じ色の廊下、照明変化、大きな視点差には弱いです。MobileCLIP等を載せる前の軽量プロトタイプです。</div>
+<h2>11. 制約</h2><table><tr><th>項目</th><th>内容</th></tr><tr><td>自己位置</td><td>絶対座標ではなくルート上の相対進捗</td></tr><tr><td>歩数</td><td>加速度からの推定</td></tr><tr><td>方角</td><td>磁気環境・持ち方の影響あり</td></tr><tr><td>画像</td><td>軽量特徴量。深層学習ではない</td></tr><tr><td>距離</td><td>0.70m歩幅仮定。測量値ではない</td></tr></table>
+<h2>12. 合格条件</h2><div class="note good">同じルートを5回歩き、GOAL付近で進捗が概ね100%に到達し、主要な曲がり角の順番が再現できればPhase 1合格です。</div>
+<h2>13. 公式資料</h2><ul><li><a href="https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages">GitHub Pagesとは</a></li><li><a href="https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site">GitHub Pages公開元設定</a></li><li><a href="https://webkit.org/blog/9674/new-webkit-features-in-safari-13/">WebKit: DeviceMotion / DeviceOrientation permission</a></li></ul>
+</main></body></html>
