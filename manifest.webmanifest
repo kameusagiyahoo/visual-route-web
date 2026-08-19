@@ -1,9 +1,9 @@
 {
-  "name": "Visual Route Lab",
+  "name": "Visual Route Lab v3",
   "short_name": "VisualRoute",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#0b1018",
   "theme_color": "#0b1018",
-  "description": "Mapless indoor route localization prototype for iPhone Safari."
+  "description": "Mapless indoor route localization with Bayesian filtering and visual embeddings."
 }

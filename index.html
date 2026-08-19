@@ -8,12 +8,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Visual Route">
 <link rel="manifest" href="./manifest.webmanifest">
-<link rel="stylesheet" href="./style.css?v=2.0.0">
-<title>Visual Route Lab v2</title>
+<link rel="stylesheet" href="./style.css?v=3.0.0">
+<title>Visual Route Lab v3</title>
 </head>
 <body>
 <header>
-  <div class="header-title">Visual Route Lab <span class="version">v2.0</span></div>
+  <div class="header-title">Visual Route Lab <span class="version">v3.0</span></div>
   <div class="header-sub">Mapless indoor route localization / Safari only</div>
 </header>
 
@@ -49,6 +49,17 @@
         <button id="btnResetCalibration" class="btn secondary">初期値に戻す</button>
       </div>
       <div id="calibrationResult" class="small"></div>
+    </div>
+
+    <div class="card">
+      <h2>AI画像Embedding</h2>
+      <div class="kv">
+        <div>モデル</div><div id="aiStatus">未読み込み（V2画像特徴で動作）</div>
+        <div>実行Backend</div><div id="aiBackend">--</div>
+        <div>WebGPU</div><div id="webgpuStatus">確認中</div>
+      </div>
+      <button id="btnLoadAI" class="btn secondary top-gap">MobileNetを読み込む</button>
+      <div class="note">任意機能です。読み込むとチェックポイント画像をニューラルEmbeddingで比較します。失敗しても従来の軽量画像特徴へ自動フォールバックします。</div>
     </div>
 
     <div class="metrics">
@@ -95,7 +106,7 @@
 
   <section id="view-nav" class="view">
     <h1>簡易ナビ</h1>
-    <p class="lead">歩数だけでなく、相対方角・曲がり角で自動補正します。さらに画像チェックポイントで途中地点へ再ローカライズできます。</p>
+    <p class="lead">V3ではルート上の各地点に「現在いる確率」を持つベイズフィルタで、歩数・相対方角・曲がり角・画像を同時に統合します。</p>
 
     <div class="card">
       <label>対象ルート</label>
@@ -121,6 +132,12 @@
       <div id="nextTurn" class="turn">ルートを選択してください</div>
     </div>
 
+    <div class="card">
+      <h2>位置確率分布</h2>
+      <canvas id="beliefCanvas" class="belief-canvas" width="680" height="150"></canvas>
+      <div id="beliefCandidates" class="small">ルートを選択してください。</div>
+    </div>
+
     <div class="canvas-wrap">
       <canvas id="navCanvas" width="340" height="340"></canvas>
       <div class="small">START方向を上として描く相対軌跡。仮歩幅0.70mであり実寸地図ではありません。</div>
@@ -139,27 +156,57 @@
     </div>
   </section>
 
+  <section id="view-graph" class="view">
+    <h1>ルートグラフ</h1>
+    <p class="lead">複数ルートのチェックポイント画像を照合し、共通地点をNode、移動区間をEdgeとしてTopological Mapを自動構築します。実寸2D/3Dマップは不要です。</p>
+
+    <div class="card">
+      <h2>グラフ構築</h2>
+      <div class="row">
+        <button id="btnBuildGraph" class="btn">グラフを再構築</button>
+        <button id="btnLoadAIGraph" class="btn secondary">AIモデルを読み込む</button>
+      </div>
+      <div id="graphStatus" class="note">未構築。チェックポイント写真が多いほど共通地点を見つけやすくなります。</div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="metric-label">Nodes</div><div id="graphNodeCount" class="metric-value">0</div><div class="metric-sub">場所クラスタ</div></div>
+      <div class="metric"><div class="metric-label">Edges</div><div id="graphEdgeCount" class="metric-value">0</div><div class="metric-sub">登録移動区間</div></div>
+    </div>
+
+    <div class="card">
+      <h2>ノード間ナビ計画</h2>
+      <label>出発Node</label>
+      <select id="graphFrom"><option value="">選択</option></select>
+      <label class="top-gap">目的Node</label>
+      <select id="graphTo"><option value="">選択</option></select>
+      <button id="btnGraphPath" class="btn secondary top-gap">最短ルートを計算</button>
+      <div id="graphPathResult" class="note">グラフ構築後に選択できます。</div>
+    </div>
+
+    <div id="graphNodesList"></div>
+  </section>
+
   <section id="view-info" class="view">
     <h1>仕様・課題</h1>
     <div class="card">
-      <h2>V2で対応した課題</h2>
+      <h2>V3で追加した機能</h2>
       <ul class="compact-list">
-        <li>20歩キャリブレーションで歩数しきい値を自動調整</li>
-        <li>歩数検出を単純なしきい値交差から「平滑化＋局所ピーク」に改善</li>
-        <li>絶対コンパスではなくSTART基準の相対方角を使用</li>
-        <li>曲がり角アンカーで歩数ドリフトを自動補正</li>
-        <li>画像特徴量を高密度化し、第2候補との差も見て誤一致を抑制</li>
-        <li>写真の暗さ・コントラスト・エッジ量を品質判定</li>
-        <li>Safariが非表示になったら計測を止め、復帰後に明示再開</li>
-        <li>対応端末ではScreen Wake Lockで画面消灯を抑制</li>
-        <li>IndexedDBデータのJSONバックアップ/復元</li>
-        <li>Service Workerをnetwork-first化し、更新が古いキャッシュに張り付く問題を軽減</li>
+        <li>HMM型ベイズフィルタでルート全地点の確率分布を保持</li>
+        <li>歩数・相対方角・曲がり角・画像観測を同一の確率分布へ統合</li>
+        <li>確率分布のエントロピーとピーク集中度から信頼度を計算</li>
+        <li>MobileNet v2 (alpha 0.25) の画像Embeddingをブラウザ内で任意利用</li>
+        <li>AIモデルが使えない場合はV2の手作り特徴へ自動フォールバック</li>
+        <li>複数ルートの共通チェックポイントをクラスタリングしてTopological Mapを生成</li>
+        <li>ルートグラフ上でDijkstra最短経路を計算</li>
+        <li>V1/V2データをそのまま読み込み可能</li>
+        <li>V2の20歩キャリブレーション・画像品質判定・バックアップ等を継承</li>
       </ul>
     </div>
     <div class="card">
       <h2>残る制約</h2>
       <div class="note">
-        ARKit/SLAMではありません。絶対座標(x,y,z)は出ません。加速度ベース歩数は歩き方・持ち方で誤差が出ます。相対方角も磁気ドリフトの影響は残ります。画像照合は深層学習ではないため、似た廊下・大きな視点差・照明差には弱いです。
+        ARKit/SLAMではないため絶対座標(x,y,z)は出ません。加速度ベース歩数と相対方角には誤差が残ります。MobileNet Embeddingは意味的耐性を改善しますが、似た廊下・大きな視点差では曖昧性が残ります。AIモデルは初回にネットワークから読み込むため、オフライン時はV2画像特徴へフォールバックします。
       </div>
     </div>
   </section>
@@ -169,6 +216,7 @@
   <button data-view="record" class="active">登録</button>
   <button data-view="routes">ルート</button>
   <button data-view="nav">ナビ</button>
+  <button data-view="graph">グラフ</button>
   <button data-view="info">仕様</button>
 </nav>
 
@@ -181,6 +229,6 @@
   </div>
 </div>
 
-<script src="./app.js?v=2.0.0"></script>
+<script src="./app.js?v=3.0.0"></script>
 </body>
 </html>

@@ -1,38 +1,118 @@
-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Visual Route Web版 実装手順書</title><style>
-:root{color-scheme:dark;--bg:#0b1018;--panel:#131b27;--line:#2a3648;--text:#f2f5fa;--muted:#9ba8ba;--accent:#4d91ff;--warn:#efb85e;--good:#65c77d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic",sans-serif;line-height:1.7}main{max-width:900px;margin:auto;padding:24px 16px 70px}h1{font-size:29px;margin:0 0 8px}h2{margin-top:38px;border-bottom:1px solid var(--line);padding-bottom:8px}p,li{color:#c8d1de}.muted{color:var(--muted)}.note{border-left:4px solid var(--accent);background:#111b2a;border-radius:8px;padding:12px 14px;margin:14px 0}.warn{border-left-color:var(--warn);background:#211c12}.good{border-left-color:var(--good);background:#102018}.step{display:grid;grid-template-columns:36px 1fr;gap:10px;margin:15px 0}.num{width:31px;height:31px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-weight:800}code{background:#090e15;padding:2px 5px;border-radius:5px}table{border-collapse:collapse;width:100%;background:var(--panel);margin:12px 0}th,td{border:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}th{background:#182231}a{color:#86b6ff}.flow{overflow:auto;background:#0e151f;border:1px solid var(--line);border-radius:12px;padding:14px;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfd9e8}
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Visual Route Lab v3 実装・更新手順</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1018;--panel:#131b27;--line:#2a3648;--text:#f2f5fa;--muted:#9ba8ba;--accent:#4d91ff;--good:#65c77d;--warn:#efb85e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic",sans-serif;line-height:1.7}
+main{max-width:900px;margin:auto;padding:24px 16px 70px}h1{font-size:29px;margin:0 0 8px}h2{margin-top:38px;border-bottom:1px solid var(--line);padding-bottom:8px}h3{margin-top:24px}
+p,li{color:#c8d1de}.muted{color:var(--muted)}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:15px;margin:14px 0}
+.note{border-left:4px solid var(--accent);background:#111b2a;border-radius:8px;padding:12px 14px}.good{border-left-color:var(--good);background:#102018}.warn{border-left-color:var(--warn);background:#211c12}
+code{background:#090e15;padding:2px 5px;border-radius:5px}.flow{overflow:auto;background:#0e151f;border:1px solid var(--line);border-radius:12px;padding:14px;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfd9e8}
+table{border-collapse:collapse;width:100%;background:var(--panel);margin:12px 0}th,td{border:1px solid var(--line);padding:9px;text-align:left;vertical-align:top}th{background:#182231}
 </style></head><body><main>
-<h1>Visual Route Lab — Web版 実装手順書</h1><p class="muted">iPhone 15 / Safari / Macなし / Xcodeなし / Expoなし / npmなし</p>
-<div class="note good"><strong>今回の方式</strong><br>静的HTML/JavaScriptをGitHub Pagesに置き、iPhoneのSafariだけで実行します。</div>
-<h2>1. 重要</h2><div class="note warn"><strong>index.htmlのファイル直開きでは完成版として使いません。</strong><br>カメラを使うためGitHub PagesのHTTPS URLからSafariで開きます。</div>
-<table><tr><th>必要</th><th>不要</th></tr><tr><td>iPhone<br>Safari<br>GitHubアカウント</td><td>Expo Go<br>Mac<br>Xcode<br>Developer Program<br>Node.js/npm<br>PC</td></tr></table>
-<h2>2. ZIPを展開</h2><div class="step"><div class="num">1</div><div>ChatGPTから <code>visual-route-web.zip</code> を「ファイル」に保存。</div></div><div class="step"><div class="num">2</div><div>ZIPをタップして展開。</div></div><div class="flow">visual-route-web/
-├── index.html
-├── README.md
-├── implementation-guide.html
-└── TEST_CHECKLIST.md</div>
-<h2>3. iPhoneだけでGitHub Repositoryを作る</h2><div class="step"><div class="num">1</div><div>Safariで <a href="https://github.com/">github.com</a> を開いてログイン。</div></div><div class="step"><div class="num">2</div><div>New repositoryを作成。例: <code>visual-route-web</code></div></div><div class="step"><div class="num">3</div><div>最短で試すならPublic repositoryで作成。</div></div>
-<h2>4. ファイルをアップロード</h2><p>Repositoryを開き、<strong>Add file → Upload files</strong> 相当の操作から、展開した4ファイルを選択してCommitします。</p><div class="note">モバイル画面で項目が見つからない場合は、Safariの「ぁあ」メニューから<strong>デスクトップ用Webサイトを表示</strong>にすると見つけやすくなることがあります。</div>
-<h2>5. GitHub PagesをON</h2><div class="step"><div class="num">1</div><div>Repository → <strong>Settings</strong>。</div></div><div class="step"><div class="num">2</div><div><strong>Pages</strong>。</div></div><div class="step"><div class="num">3</div><div>Build and deployment → Source = <strong>Deploy from a branch</strong>。</div></div><div class="step"><div class="num">4</div><div>Branch = <strong>main</strong>、Folder = <strong>/(root)</strong> → Save。</div></div><div class="step"><div class="num">5</div><div>Pages画面に出た公開URLをSafariで開く。</div></div>
-<h2>6. 初回起動</h2><ol><li><strong>① センサーを許可</strong>を押す。</li><li>iOSのモーション/画面の向きの許可を承認。</li><li>iPhoneを回して方角が変わることを確認。</li><li>上下に軽く動かして動的加速度が変わることを確認。</li></ol><p>iOS SafariではDeviceMotion / DeviceOrientationの許可要求をユーザー操作から行う必要があります。アプリはこの方式で実装済みです。</p>
-<h2>7. 歩数検出を合わせる</h2><div class="flow">加速度
-  ↓
-重力のゆっくりした成分を除く
-  ↓
-しきい値を超えたピーク
-  ↓
-推定1歩</div><p>実際に10歩歩いて調整します。</p><ul><li>10歩→15歩: しきい値を上げる</li><li>10歩→6歩: しきい値を下げる</li><li>初期値: 1.10 m/s²</li></ul>
-<h2>8. ルート登録</h2><ol><li>ルート名を入力。</li><li>START。</li><li>普段に近い持ち方で歩く。</li><li>曲がり角・ドア・固定棚などで「現在地点を写真で記録」。</li><li>GOALでSTOP。</li></ol>
-<h2>9. 再走行</h2><ol><li>ナビタブでルート選択。</li><li>基本テストでは登録時と同じSTART地点。</li><li>ナビ開始。</li><li>同じルートを歩き、進捗%を見る。</li></ol>
-<h2>10. 画像補正</h2><p>AIモデルなしで、8×8の明るさ配置とRGBヒストグラムを比較します。</p><div class="flow">現在画像
-  ↓
-軽量画像特徴
-  ↓
-登録写真と比較
-  ↓
-最も似た「○歩地点」
-  ↓
-歩数位置を補正</div><div class="note warn">同じ色の廊下、照明変化、大きな視点差には弱いです。MobileCLIP等を載せる前の軽量プロトタイプです。</div>
-<h2>11. 制約</h2><table><tr><th>項目</th><th>内容</th></tr><tr><td>自己位置</td><td>絶対座標ではなくルート上の相対進捗</td></tr><tr><td>歩数</td><td>加速度からの推定</td></tr><tr><td>方角</td><td>磁気環境・持ち方の影響あり</td></tr><tr><td>画像</td><td>軽量特徴量。深層学習ではない</td></tr><tr><td>距離</td><td>0.70m歩幅仮定。測量値ではない</td></tr></table>
-<h2>12. 合格条件</h2><div class="note good">同じルートを5回歩き、GOAL付近で進捗が概ね100%に到達し、主要な曲がり角の順番が再現できればPhase 1合格です。</div>
-<h2>13. 公式資料</h2><ul><li><a href="https://docs.github.com/en/pages/getting-started-with-github-pages/what-is-github-pages">GitHub Pagesとは</a></li><li><a href="https://docs.github.com/en/pages/getting-started-with-github-pages/configuring-a-publishing-source-for-your-github-pages-site">GitHub Pages公開元設定</a></li><li><a href="https://webkit.org/blog/9674/new-webkit-features-in-safari-13/">WebKit: DeviceMotion / DeviceOrientation permission</a></li></ul>
+<h1>Visual Route Lab v3</h1>
+<p class="muted">iPhone 15 / Safari / GitHub Pages / Mac・Xcode・Expo不要</p>
+
+<div class="note good"><strong>既にV2が動いている場合</strong><br>
+新しいリポジトリは不要です。ZIPの5ファイルを既存GitHub Pagesリポジトリのrootへ上書きCommitしてください。</div>
+
+<h2>1. 上書きするファイル</h2>
+<div class="flow">index.html
+style.css
+app.js
+manifest.webmanifest
+sw.js</div>
+<p>README、CHANGELOG、TEST_CHECKLIST、implementation-guideはGitHubへ置かなくてもアプリは動きます。</p>
+
+<h2>2. 更新確認</h2>
+<ol>
+<li>GitHubで5ファイルを上書きしてCommit。</li>
+<li>GitHub Pages URLをSafariで開く。</li>
+<li>ヘッダーが <strong>v3.0</strong> になれば成功。</li>
+<li>古い表示ならSafariで再読み込み。Service Workerはnetwork-firstで更新されます。</li>
+</ol>
+
+<h2>3. 最初に試す順番</h2>
+<ol>
+<li>「登録」→ センサー許可。</li>
+<li>20歩キャリブレーション。</li>
+<li>30〜60歩の短いルートを登録。</li>
+<li>START付近・曲がり角・GOAL付近でチェックポイント画像を撮る。</li>
+<li>「ナビ」で同じSTARTから再走行。</li>
+<li>「位置確率分布」が前方へ移動することを確認。</li>
+</ol>
+
+<h2>4. ベイズフィルタ</h2>
+<div class="flow">P(position=0..N)
+       │
+       ├─ 1歩 → transition
+       ├─ 方角 → heading likelihood
+       ├─ turn → turn likelihood
+       └─ image → checkpoint likelihood
+                 ↓
+             normalize
+                 ↓
+        MAP位置 + Confidence</div>
+<p>V2のように補正値を直接足すのではなく、「どの地点にいる可能性が高いか」を分布として保持します。</p>
+
+<h2>5. AI画像Embedding</h2>
+<p>「MobileNetを読み込む」は任意です。押すとTensorFlow.jsとMobileNetV2 α0.25を外部CDN/モデル配信元から初回読み込みします。</p>
+<table>
+<tr><th>状態</th><th>挙動</th></tr>
+<tr><td>AI未読込</td><td>V2のRGB/edge/hash特徴で照合</td></tr>
+<tr><td>AI読込成功</td><td>MobileNet Embedding + V2特徴をハイブリッド</td></tr>
+<tr><td>AI読込失敗</td><td>自動でV2特徴へフォールバック</td></tr>
+</table>
+<div class="note warn">AIモデルは完全オフライン必須機能にはしていません。モデルを一度も読み込めない通信環境でも、ルート登録・ベイズナビは利用できます。</div>
+
+<h2>6. なぜV3はWebGPU推論ではないか</h2>
+<p>iOS 26 Safari自体はWebGPUを利用できる環境ですが、V3は実機安定性を優先し、TensorFlow.js MobileNetをWebGL backendで動かします。画面にはWebGPU availabilityだけ表示します。</p>
+<p>WebGPU版は将来の実験機能として分離した方が、ナビ本体まで巻き込んで不安定になるのを避けられます。</p>
+
+<h2>7. ルートグラフ</h2>
+<p>最低2本のルートを登録し、同じ場所でチェックポイント写真を撮ってください。</p>
+<div class="flow">Route A: 玄関 ─ [廊下📷] ─ リビング
+Route B: 寝室 ─ [廊下📷] ─ 洗面所
+                    ↓ image cluster
+             共通Node「廊下」
+                    ↓
+       Topological Route Graph</div>
+<ol>
+<li>「グラフ」タブを開く。</li>
+<li>可能ならAIモデルを読み込む。</li>
+<li>「グラフを再構築」。</li>
+<li>共通地点と判定されたNodeを確認。</li>
+<li>出発Nodeと目的Nodeを選び「最短ルートを計算」。</li>
+</ol>
+
+<h2>8. 写真の撮り方</h2>
+<ul>
+<li>START/GOAL付近もできれば写真を撮る。</li>
+<li>ドア枠、柱、固定棚、窓など動きにくい物を含める。</li>
+<li>壁だけ、床だけ、白い廊下だけを避ける。</li>
+<li>複数ルートで共通地点にしたい場所は、なるべく同じ向きで撮る。</li>
+</ul>
+
+<h2>9. V2データ</h2>
+<p>IndexedDBのV2データはそのまま読み込みます。削除や再登録は不要です。AI Embeddingがない旧写真は、AIモデル読込後に必要になった時点で遅延生成します。</p>
+
+<h2>10. 現時点の本質的制約</h2>
+<ul>
+<li>絶対座標(x,y,z)は出ない。</li>
+<li>初見の建物では使えない。</li>
+<li>似た場所が連続すると画像だけでは識別困難。</li>
+<li>Safariを閉じた状態で継続追跡はしない。</li>
+<li>歩数はiOS Pedometerではなく加速度推定。</li>
+</ul>
+
+<h2>11. V3評価</h2>
+<p>同じルートを5回歩き、以下を記録してください。</p>
+<ul>
+<li>GOAL到達時のMAP推定歩数</li>
+<li>GOAL時の信頼度</li>
+<li>位置確率分布が複数ピークになった場所</li>
+<li>画像観測前後のMAP位置</li>
+<li>AIあり/なしの画像一致率</li>
+<li>グラフで共通Nodeが正しく統合されたか</li>
+</ul>
 </main></body></html>

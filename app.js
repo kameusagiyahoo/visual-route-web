@@ -1,7 +1,7 @@
 (() => {
 'use strict';
 
-const APP_VERSION = '2.0.0';
+const APP_VERSION = '3.0.0';
 const DB_NAME = 'visual-route-web-v1';
 const DB_VERSION = 2;
 const DEFAULT_THRESHOLD = 1.10;
@@ -1124,6 +1124,822 @@ async function init() {
   setInterval(() => { if (state.recording) renderLive(); }, 500);
   try { await openDB(); await refreshRoutes(); } catch (error) { console.error(error); }
   renderLive(); renderNav(); renderCompassQuality();
+}
+
+
+/* ===========================
+   V3 overlay
+   =========================== */
+
+const V3_AI_TFJS = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js';
+const V3_AI_MOBILENET = 'https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.1/dist/mobilenet.min.js';
+const V3_AI_MODEL_NAME = 'MobileNetV2 α0.25';
+const BELIEF_HEADING_SIGMA = 38;
+const BELIEF_VISUAL_SIGMA = 1.8;
+const GRAPH_DESCRIPTOR_THRESHOLD = 0.86;
+const GRAPH_AI_THRESHOLD = 0.90;
+
+state.belief = null;
+state.beliefRouteId = null;
+state.ai = { status: 'idle', model: null, backend: null, error: null, loading: null };
+state.graph = { nodes: [], edges: [], builtAt: null };
+
+function normalizeProbabilities(arr) {
+  let sum = 0;
+  for (let i = 0; i < arr.length; i += 1) sum += arr[i];
+  if (!Number.isFinite(sum) || sum <= 1e-30) {
+    const uniform = 1 / Math.max(1, arr.length);
+    for (let i = 0; i < arr.length; i += 1) arr[i] = uniform;
+    return arr;
+  }
+  for (let i = 0; i < arr.length; i += 1) arr[i] /= sum;
+  return arr;
+}
+
+function gaussian(x, sigma) {
+  return Math.exp(-0.5 * (x / Math.max(0.001, sigma)) ** 2);
+}
+
+function initBelief(route, center = 0, sigma = 0.65) {
+  if (!route) { state.belief = null; state.beliefRouteId = null; return; }
+  const n = Math.max(1, Math.round(route.totalSteps)) + 1;
+  const b = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) b[i] = gaussian(i - center, sigma) + 1e-9;
+  normalizeProbabilities(b);
+  state.belief = b;
+  state.beliefRouteId = route.id;
+}
+
+function beliefPredictOneStep() {
+  const b = state.belief;
+  if (!b) return;
+  const next = new Float64Array(b.length);
+  // A detected step usually advances one route step, but can be a false/missed step.
+  const transitions = [
+    [0, 0.10],
+    [1, 0.72],
+    [2, 0.16],
+    [3, 0.02],
+  ];
+  for (let i = 0; i < b.length; i += 1) {
+    const p = b[i];
+    if (p <= 0) continue;
+    for (const [d, w] of transitions) {
+      const j = Math.min(b.length - 1, i + d);
+      next[j] += p * w;
+    }
+  }
+  state.belief = normalizeProbabilities(next);
+}
+
+function routeHeadingAtStep(route, step) {
+  if (!route?.events?.length) return 0;
+  let best = route.events[0];
+  let err = Infinity;
+  for (const ev of route.events) {
+    const e = Math.abs((ev.steps ?? 0) - step);
+    if (e < err) { err = e; best = ev; }
+  }
+  return best?.relHeading ?? 0;
+}
+
+function beliefObserveHeading(currentRelHeading) {
+  if (!state.belief || !state.navRoute || currentRelHeading == null) return;
+  const b = state.belief;
+  for (let i = 0; i < b.length; i += 1) {
+    const expected = routeHeadingAtStep(state.navRoute, i);
+    const d = angleDiff(expected, currentRelHeading);
+    // Floor likelihood avoids catastrophic collapse when compass is temporarily poor.
+    const likelihood = 0.08 + 0.92 * gaussian(d, BELIEF_HEADING_SIGMA);
+    b[i] *= likelihood;
+  }
+  normalizeProbabilities(b);
+}
+
+function beliefObservePosition(step, sigma = BELIEF_VISUAL_SIGMA, strength = 4.0) {
+  if (!state.belief) return;
+  const b = state.belief;
+  for (let i = 0; i < b.length; i += 1) {
+    const local = gaussian(i - step, sigma);
+    b[i] *= 1 + strength * local;
+  }
+  normalizeProbabilities(b);
+}
+
+function beliefObserveTurn(targetStep, strength = 3.4) {
+  beliefObservePosition(targetStep, 2.2, strength);
+}
+
+function beliefStats() {
+  const b = state.belief;
+  if (!b?.length) return { map: 0, mean: 0, confidence: 0, peakMass: 0, entropy: 1, top: [] };
+  let map = 0, maxP = -1, mean = 0, entropy = 0;
+  const pairs = [];
+  for (let i = 0; i < b.length; i += 1) {
+    const p = b[i];
+    mean += i * p;
+    if (p > maxP) { maxP = p; map = i; }
+    if (p > 0) entropy -= p * Math.log(p);
+    pairs.push([i, p]);
+  }
+  const maxEntropy = Math.log(Math.max(2, b.length));
+  const normalizedEntropy = clamp(entropy / maxEntropy, 0, 1);
+  let peakMass = 0;
+  for (let i = Math.max(0, map - 2); i <= Math.min(b.length - 1, map + 2); i += 1) peakMass += b[i];
+  const confidence = clamp(0.58 * (1 - normalizedEntropy) + 0.42 * peakMass, 0, 1);
+  pairs.sort((a, c) => c[1] - a[1]);
+  return { map, mean, confidence, peakMass, entropy: normalizedEntropy, top: pairs.slice(0, 4) };
+}
+
+function drawBelief() {
+  const canvas = $('beliefCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const cssW = Math.max(280, canvas.clientWidth || 680);
+  const cssH = 150;
+  if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  ctx.fillStyle = '#0b1118'; ctx.fillRect(0, 0, cssW, cssH);
+  const b = state.belief;
+  if (!b?.length) {
+    ctx.fillStyle = '#718096'; ctx.font = '12px -apple-system'; ctx.fillText('No probability distribution', 12, 24);
+    return;
+  }
+  let maxP = 0;
+  for (const p of b) maxP = Math.max(maxP, p);
+  const padX = 12, baseY = 126, plotH = 96;
+  const barW = Math.max(1, (cssW - padX * 2) / b.length);
+  for (let i = 0; i < b.length; i += 1) {
+    const h = maxP > 0 ? (b[i] / maxP) * plotH : 0;
+    ctx.fillStyle = '#3d74bc';
+    ctx.fillRect(padX + i * barW, baseY - h, Math.max(1, barW - 0.4), h);
+  }
+  const stats = beliefStats();
+  const x = padX + stats.map / Math.max(1, b.length - 1) * (cssW - padX * 2);
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, 18); ctx.lineTo(x, baseY + 2); ctx.stroke();
+  ctx.fillStyle = '#9fb3cc'; ctx.font = '11px -apple-system';
+  ctx.fillText('START', padX, 143);
+  ctx.textAlign = 'right'; ctx.fillText('GOAL', cssW - padX, 143); ctx.textAlign = 'left';
+}
+
+function renderBeliefCandidates() {
+  const el = $('beliefCandidates');
+  if (!el) return;
+  if (!state.belief || !state.navRoute) { el.textContent = 'ルートを選択してください。'; return; }
+  const s = beliefStats();
+  const top = s.top.map(([step, p]) => `${step}歩 ${(p * 100).toFixed(1)}%`).join(' / ');
+  el.textContent = `最尤 ${s.map}歩・期待値 ${s.mean.toFixed(1)}歩・ピーク周辺 ${(s.peakMass * 100).toFixed(0)}% ｜ ${top}`;
+}
+
+function countStep() {
+  if (state.calibrating) return;
+  if (state.recording) {
+    state.recordSteps += 1;
+    state.recordEvents.push({
+      t: Date.now(),
+      steps: state.recordSteps,
+      heading: state.heading,
+      relHeading: relHeading(state.recordStartHeading, state.heading) ?? 0,
+      orientation: { ...state.orientation },
+    });
+  }
+  if (state.navActive) {
+    state.navRawSteps += 1;
+    const rel = relHeading(state.navStartHeading, state.heading) ?? 0;
+    const ev = { t: Date.now(), steps: state.navRawSteps, relHeading: rel, heading: state.heading };
+    state.navEvents.push(ev);
+    beliefPredictOneStep();
+    beliefObserveHeading(rel);
+    maybeCorrectFromTurn(ev);
+  }
+  renderLive();
+  renderNav();
+}
+
+function scriptOnce(src, globalName) {
+  if (globalName && window[globalName]) return Promise.resolve(window[globalName]);
+  return new Promise((resolve, reject) => {
+    const existing = [...document.scripts].find((s) => s.src === src);
+    if (existing) {
+      const timer = setInterval(() => {
+        if (!globalName || window[globalName]) { clearInterval(timer); resolve(globalName ? window[globalName] : true); }
+      }, 100);
+      setTimeout(() => { clearInterval(timer); reject(new Error(`timeout: ${src}`)); }, 20000);
+      return;
+    }
+    const script = document.createElement('script');
+    script.src = src; script.async = true; script.crossOrigin = 'anonymous';
+    script.onload = () => resolve(globalName ? window[globalName] : true);
+    script.onerror = () => reject(new Error(`load failed: ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
+function renderAIStatus() {
+  if (!$('aiStatus')) return;
+  const s = state.ai.status;
+  $('webgpuStatus').textContent = navigator.gpu ? '利用可能' : '未検出';
+  if (s === 'ready') {
+    $('aiStatus').textContent = `${V3_AI_MODEL_NAME} 準備完了`;
+    $('aiStatus').className = 'ai-ready';
+    $('aiBackend').textContent = state.ai.backend || '--';
+    $('btnLoadAI').textContent = 'AIモデル読み込み済み';
+    $('btnLoadAI').disabled = true;
+    if ($('btnLoadAIGraph')) { $('btnLoadAIGraph').textContent = 'AIモデル読み込み済み'; $('btnLoadAIGraph').disabled = true; }
+  } else if (s === 'loading') {
+    $('aiStatus').textContent = 'モデルをダウンロード/初期化中…';
+    $('aiStatus').className = 'ai-loading';
+    $('aiBackend').textContent = '--';
+  } else if (s === 'error') {
+    $('aiStatus').textContent = `失敗: ${state.ai.error || 'unknown'}（V2特徴へフォールバック）`;
+    $('aiStatus').className = 'ai-error';
+    $('aiBackend').textContent = '--';
+  } else {
+    $('aiStatus').textContent = '未読み込み（V2画像特徴で動作）';
+    $('aiStatus').className = '';
+    $('aiBackend').textContent = '--';
+  }
+}
+
+async function loadAIModel() {
+  if (state.ai.status === 'ready') return state.ai.model;
+  if (state.ai.loading) return state.ai.loading;
+  state.ai.status = 'loading'; renderAIStatus();
+  state.ai.loading = (async () => {
+    try {
+      await scriptOnce(V3_AI_TFJS, 'tf');
+      await scriptOnce(V3_AI_MOBILENET, 'mobilenet');
+      await window.tf.ready();
+      // iOS Safari: standard tfjs bundle's WebGL backend is mature and reliable.
+      if (window.tf.findBackend('webgl')) {
+        await window.tf.setBackend('webgl');
+        await window.tf.ready();
+      }
+      state.ai.backend = window.tf.getBackend();
+      state.ai.model = await window.mobilenet.load({ version: 2, alpha: 0.25 });
+      state.ai.status = 'ready'; state.ai.error = null;
+      renderAIStatus();
+      return state.ai.model;
+    } catch (error) {
+      state.ai.status = 'error';
+      state.ai.error = error?.message || String(error);
+      renderAIStatus();
+      throw error;
+    } finally {
+      state.ai.loading = null;
+    }
+  })();
+  return state.ai.loading;
+}
+
+async function computeAIEmbeddingFromCanvas(canvas) {
+  if (state.ai.status !== 'ready' || !state.ai.model || !window.tf) return null;
+  let tensor = null;
+  try {
+    tensor = state.ai.model.infer(canvas, true);
+    const values = Array.from(await tensor.data());
+    let norm = Math.sqrt(values.reduce((s, v) => s + v * v, 0)) || 1;
+    return values.map((v) => Number((v / norm).toFixed(6)));
+  } finally {
+    tensor?.dispose?.();
+  }
+}
+
+async function blobToCanvas(blob, maxWidth = 720) {
+  let bitmap = null;
+  try { if ('createImageBitmap' in window) bitmap = await createImageBitmap(blob); } catch (_) {}
+  const canvas = document.createElement('canvas');
+  if (bitmap) {
+    const scale = Math.min(1, maxWidth / bitmap.width);
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close?.();
+    return canvas;
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image(); el.onload = () => resolve(el); el.onerror = reject; el.src = url;
+    });
+    const scale = Math.min(1, maxWidth / img.naturalWidth);
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+async function ensureAIEmbedding(cp) {
+  if (cp.aiEmbedding?.length) return cp.aiEmbedding;
+  if (state.ai.status !== 'ready' || !(cp.blob instanceof Blob)) return null;
+  const canvas = await blobToCanvas(cp.blob);
+  cp.aiEmbedding = await computeAIEmbeddingFromCanvas(canvas);
+  return cp.aiEmbedding;
+}
+
+function aiSimilarity(a, b) {
+  if (!a?.length || !b?.length || a.length !== b.length) return null;
+  return clamp((cosine(a, b) + 1) / 2, 0, 1);
+}
+
+async function captureVideoFrame() {
+  const video = $('video');
+  if (video.videoWidth < 2 || video.videoHeight < 2) await sleep(250);
+  const maxWidth = 720;
+  const scale = Math.min(1, maxWidth / video.videoWidth);
+  const width = Math.max(1, Math.round(video.videoWidth * scale));
+  const height = Math.max(1, Math.round(video.videoHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width; canvas.height = height;
+  canvas.getContext('2d').drawImage(video, 0, 0, width, height);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.76));
+  const descriptor = computeDescriptorV2(canvas);
+  const aiEmbedding = state.ai.status === 'ready' ? await computeAIEmbeddingFromCanvas(canvas) : null;
+  return { blob, descriptor, aiEmbedding };
+}
+
+async function captureCamera() {
+  try {
+    const snap = await captureVideoFrame();
+    if (state.cameraMode === 'checkpoint') {
+      if (!state.recording) { closeCamera(); return; }
+      const quality = imageQualityMessage(snap.descriptor);
+      if (!quality.ok && !confirm(`画像品質に注意: ${quality.text}\nそれでも保存しますか？`)) {
+        closeCamera(); return;
+      }
+      state.recordCheckpoints.push({
+        id: `cp-${Date.now()}`,
+        steps: state.recordSteps,
+        heading: state.heading,
+        relHeading: relHeading(state.recordStartHeading, state.heading),
+        blob: snap.blob,
+        descriptor: snap.descriptor,
+        aiEmbedding: snap.aiEmbedding,
+      });
+      closeCamera();
+      alert(`${state.recordSteps}歩地点の画像を保存しました。${snap.aiEmbedding ? '\nAI Embeddingも保存しました。' : ''}${quality.ok ? '' : `\n注意: ${quality.text}`}`);
+    } else {
+      closeCamera();
+      await performVisualMatch(snap.descriptor, snap.aiEmbedding);
+    }
+  } catch (error) {
+    alert(`撮影処理に失敗しました: ${error?.message || error}`);
+  }
+}
+
+async function stopRecording() {
+  state.recording = false;
+  releaseWakeLock();
+  if (state.recordSteps < 3) {
+    alert('歩数が少なすぎるため保存しません。');
+    resetRecordUI();
+    return;
+  }
+  const route = {
+    schemaVersion: 3,
+    appVersion: APP_VERSION,
+    id: `route-${Date.now()}`,
+    name: $('routeName').value.trim() || '無題ルート',
+    createdAt: new Date().toISOString(),
+    durationMs: Date.now() - state.recordStartAt,
+    totalSteps: state.recordSteps,
+    strideM: STRIDE_M,
+    startHeading: state.recordStartHeading,
+    stepThreshold: state.detector.threshold,
+    events: state.recordEvents,
+    turns: detectTurns(state.recordEvents),
+    checkpoints: state.recordCheckpoints,
+  };
+  await putRoute(route);
+  alert(`保存しました\n${route.name}\n${route.totalSteps}歩 / 曲がり${route.turns.length} / 写真${route.checkpoints.length}枚`);
+  resetRecordUI();
+  await refreshRoutes();
+}
+
+async function performVisualMatch(descriptor, currentAIEmbedding = null) {
+  if (!state.navRoute?.checkpoints?.length) {
+    alert('このルートにはチェックポイント画像がありません。');
+    return;
+  }
+  state.navRoute = await ensureCheckpointDescriptors(state.navRoute);
+  const currentRel = relHeading(state.navStartHeading, state.heading) ?? 0;
+  const candidates = [];
+  let routeChanged = false;
+
+  for (const cp of state.navRoute.checkpoints) {
+    if (!cp.descriptor?.views) continue;
+    const handScore = descriptorSimilarity(descriptor, cp.descriptor);
+    let neuralScore = null;
+    if (currentAIEmbedding && state.ai.status === 'ready') {
+      const before = !!cp.aiEmbedding?.length;
+      try { await ensureAIEmbedding(cp); } catch (_) {}
+      if (!before && cp.aiEmbedding?.length) routeChanged = true;
+      neuralScore = aiSimilarity(currentAIEmbedding, cp.aiEmbedding);
+    }
+    const imageScore = neuralScore == null ? handScore : 0.78 * neuralScore + 0.22 * handScore;
+    const headingScore = typeof cp.relHeading === 'number'
+      ? 1 - clamp(angleDiff(cp.relHeading, currentRel) / 100, 0, 1)
+      : 0.5;
+    const score = 0.93 * imageScore + 0.07 * headingScore;
+    candidates.push({ cp, score, imageScore, neuralScore, handScore, headingScore });
+  }
+  if (routeChanged) await putRoute(state.navRoute);
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0], second = candidates[1];
+  if (!best) { alert('比較可能なチェックポイントがありません。'); return; }
+
+  const margin = second ? best.score - second.score : 1;
+  const aiUsed = best.neuralScore != null;
+  const strongThreshold = aiUsed ? 0.78 : 0.72;
+  const acceptThreshold = aiUsed ? 0.69 : 0.63;
+  const strong = best.score >= strongThreshold && margin >= 0.025;
+  const acceptable = best.score >= acceptThreshold && margin >= 0.012;
+  state.navCandidate = acceptable ? best : null;
+
+  $('matchResult').hidden = false;
+  $('matchScore').textContent = `一致 ${(best.score * 100).toFixed(0)}% / 候補差 ${(margin * 100).toFixed(1)}pt`;
+  $('matchScore').className = `match ${strong ? 'good' : acceptable ? 'weak' : 'bad'}`;
+  let detail = `最有力: ${best.cp.steps}歩地点。`;
+  if (aiUsed) detail += ` MobileNet ${(best.neuralScore * 100).toFixed(0)}% + 軽量特徴 ${(best.handScore * 100).toFixed(0)}%。`;
+  else detail += ` 軽量特徴 ${(best.handScore * 100).toFixed(0)}%。AIモデルは未使用。`;
+  if (strong) detail += ' ベイズ位置観測として強く利用できます。';
+  else if (acceptable) detail += ' 利用可能ですが、確率分布へ弱めに反映します。';
+  else detail += ' 曖昧です。構図を合わせて再撮影してください。';
+  if (second) detail += ` 第2候補は${second.cp.steps}歩地点。`;
+  $('matchDetail').textContent = detail;
+  $('btnApplyMatch').hidden = !acceptable;
+}
+
+function applyVisualMatch() {
+  if (!state.navCandidate) return;
+  const cp = state.navCandidate.cp;
+  const strong = state.navCandidate.score >= (state.navCandidate.neuralScore != null ? 0.78 : 0.72);
+  if (state.belief) {
+    beliefObservePosition(cp.steps, strong ? 1.4 : 2.4, strong ? 7.0 : 3.0);
+  } else {
+    state.navOffset = cp.steps - state.navRawSteps;
+  }
+  state.navEstimateStep = cp.steps;
+  state.lastVisualCorrection = { at: Date.now(), steps: cp.steps, score: state.navCandidate.score };
+  $('visualCorrectionLabel').textContent = `${cp.steps}歩を観測`;
+  $('matchDetail').textContent += ' 確率分布へ観測を反映しました。';
+  renderNav();
+}
+
+function maybeCorrectFromTurn(navEvent) {
+  const route = state.navRoute;
+  if (!route?.turns?.length) return;
+  const delta = signedAngle(state.navTurnAnchorHeading, navEvent.relHeading);
+  if (Math.abs(delta) < TURN_THRESHOLD_DEG || navEvent.steps - state.navTurnAnchorStep < TURN_MIN_STEP_GAP) return;
+
+  const navTurn = { steps: navEvent.steps, relHeading: navEvent.relHeading, delta };
+  state.navTurnAnchorHeading = navEvent.relHeading;
+  state.navTurnAnchorStep = navEvent.steps;
+
+  let matchIndex = -1, bestError = Infinity;
+  for (let i = 0; i < route.turns.length; i += 1) {
+    const rt = route.turns[i];
+    const sameDirection = Math.sign(rt.delta) === Math.sign(navTurn.delta);
+    if (!sameDirection) continue;
+    const magError = Math.abs(Math.abs(rt.delta) - Math.abs(navTurn.delta));
+    if (magError > 70) continue;
+    const beliefPenalty = state.belief ? Math.abs(rt.steps - beliefStats().map) * 2.5 : Math.abs(rt.steps - (state.navRawSteps + state.navOffset));
+    const error = magError + beliefPenalty;
+    if (error < bestError) { bestError = error; matchIndex = i; }
+  }
+  if (matchIndex < 0) return;
+  const target = route.turns[matchIndex].steps;
+  if (state.belief) beliefObserveTurn(target, 4.2);
+  state.lastTurnCorrection = { at: Date.now(), routeTurn: matchIndex + 1, applied: 0, target };
+  state.navMatchedTurnIndex = Math.max(state.navMatchedTurnIndex, matchIndex + 1);
+}
+
+function confidenceForNav() {
+  const stats = beliefStats();
+  if (!state.belief) return { label: '低', cls: 'confidence-low' };
+  if (stats.confidence >= 0.64) return { label: '高', cls: 'confidence-high' };
+  if (stats.confidence >= 0.36) return { label: '中', cls: 'confidence-medium' };
+  return { label: '低', cls: 'confidence-low' };
+}
+
+function renderNav() {
+  const route = state.navRoute;
+  const currentRel = state.navActive ? relHeading(state.navStartHeading, state.heading) : null;
+  $('navRawSteps').textContent = String(state.navRawSteps);
+  $('navRelativeHeading').textContent = currentRel == null ? '--°' : `${currentRel.toFixed(0)}°`;
+
+  if (!route) {
+    $('navSteps').textContent = '0歩'; $('navProgressValue').textContent = '0%'; $('navProgressBar').style.width = '0%';
+    $('navRecordedHeading').textContent = '--°'; $('navHeadingDiff').textContent = '--°'; $('nextTurn').textContent = 'ルートを選択してください';
+    $('navConfidence').textContent = '--'; $('navConfidence').className = 'metric-value confidence-medium';
+    clearCanvas($('navCanvas')); drawBelief(); renderBeliefCandidates(); return;
+  }
+
+  if (!state.belief || state.beliefRouteId !== route.id) initBelief(route, 0);
+  const stats = beliefStats();
+  const estimate = clamp(stats.map, 0, route.totalSteps);
+  state.navEstimateStep = estimate;
+  const progress = clamp(estimate / Math.max(1, route.totalSteps), 0, 1);
+  const expectedHeading = routeHeadingAtStep(route, estimate);
+  const headingDiff = currentRel == null ? null : angleDiff(expectedHeading, currentRel);
+  const confidence = confidenceForNav();
+
+  $('navSteps').textContent = `${Math.round(estimate)}歩`;
+  $('navProgressValue').textContent = `${Math.round(progress * 100)}%`;
+  $('navProgressBar').style.width = `${progress * 100}%`;
+  $('navRecordedHeading').textContent = `${expectedHeading.toFixed(0)}°`;
+  $('navHeadingDiff').textContent = headingDiff == null ? '--°' : `${headingDiff.toFixed(0)}°`;
+  $('navConfidence').textContent = confidence.label;
+  $('navConfidence').className = `metric-value ${confidence.cls}`;
+  $('turnCorrectionLabel').textContent = state.lastTurnCorrection ? `${state.lastTurnCorrection.target}歩turn観測` : 'なし';
+  $('visualCorrectionLabel').textContent = state.lastVisualCorrection ? `${state.lastVisualCorrection.steps}歩image観測` : 'なし';
+
+  const turn = nextRouteTurn(route, estimate);
+  $('nextTurn').textContent = progress >= 0.98
+    ? 'GOAL付近です'
+    : turn ? `次の大きな方向変化まで約 ${Math.max(0, Math.round(turn.steps - estimate))} 歩` : 'この先に大きな方向変化はありません';
+  drawRoute($('navCanvas'), route, progress);
+  drawBelief();
+  renderBeliefCandidates();
+}
+
+async function loadNavRoute(id) {
+  const routes = (await getRoutes()).map(normalizeRoute);
+  state.navRoute = routes.find((r) => r.id === id) || null;
+  state.navActive = false;
+  state.navRawSteps = 0; state.navOffset = 0; state.navEstimateStep = 0; state.navEvents = [];
+  state.lastTurnCorrection = null; state.lastVisualCorrection = null; state.navCandidate = null;
+  state.navMatchedTurnIndex = 0;
+  initBelief(state.navRoute, 0);
+  $('matchResult').hidden = true;
+  renderNav();
+}
+
+async function startNavigation() {
+  if (!ensureSensorReadyForRoute()) return;
+  if (!state.navRoute) { alert('ルートを選択してください。'); return; }
+  state.navActive = true;
+  state.navRawSteps = 0; state.navOffset = 0; state.navEstimateStep = 0; state.navEvents = [];
+  state.navStartHeading = state.heading;
+  state.navTurnAnchorHeading = 0; state.navTurnAnchorStep = 0; state.navMatchedTurnIndex = 0;
+  state.lastTurnCorrection = null; state.lastVisualCorrection = null; state.navCandidate = null;
+  state.measurementPaused = false;
+  initBelief(state.navRoute, 0);
+  resetDetectorTransient();
+  renderNavButtons(true);
+  await requestWakeLock();
+  renderNav();
+}
+
+function checkpointPairSimilarity(a, b) {
+  const ai = aiSimilarity(a.aiEmbedding, b.aiEmbedding);
+  if (ai != null) return { score: ai, source: 'ai' };
+  if (a.descriptor && b.descriptor) return { score: descriptorSimilarity(a.descriptor, b.descriptor), source: 'descriptor' };
+  return { score: 0, source: 'none' };
+}
+
+async function prepareRouteEmbeddings(routes) {
+  if (state.ai.status !== 'ready') return false;
+  let changedAny = false;
+  for (const route of routes) {
+    let changed = false;
+    for (const cp of route.checkpoints || []) {
+      if (!cp.aiEmbedding?.length && cp.blob instanceof Blob) {
+        try { await ensureAIEmbedding(cp); if (cp.aiEmbedding?.length) changed = true; } catch (_) {}
+      }
+    }
+    if (changed) { route.schemaVersion = Math.max(3, route.schemaVersion || 1); await putRoute(route); changedAny = true; }
+  }
+  return changedAny;
+}
+
+function unionFind(n) {
+  const p = Array.from({ length: n }, (_, i) => i);
+  const find = (x) => p[x] === x ? x : (p[x] = find(p[x]));
+  const join = (a, b) => { a = find(a); b = find(b); if (a !== b) p[b] = a; };
+  return { p, find, join };
+}
+
+async function buildRouteGraph() {
+  const routes = (await getRoutes()).map(normalizeRoute);
+  if (!routes.length) {
+    state.graph = { nodes: [], edges: [], builtAt: Date.now() };
+    renderGraph(); return;
+  }
+  $('graphStatus').textContent = '構築中…';
+  if (state.ai.status === 'ready') await prepareRouteEmbeddings(routes);
+
+  const anchors = [];
+  for (const route of routes) {
+    const cps = [...(route.checkpoints || [])].sort((a, b) => a.steps - b.steps);
+    const routeAnchors = [];
+
+    // Always keep route-specific endpoints; attach nearby photo when available.
+    const firstPhoto = cps.find((cp) => cp.steps <= 3) || null;
+    const lastPhoto = [...cps].reverse().find((cp) => cp.steps >= route.totalSteps - 3) || null;
+    routeAnchors.push({ routeId: route.id, routeName: route.name, step: 0, kind: 'start', cp: firstPhoto, key: `${route.id}:start` });
+    for (const cp of cps) {
+      if (cp === firstPhoto || cp === lastPhoto) continue;
+      routeAnchors.push({ routeId: route.id, routeName: route.name, step: cp.steps, kind: 'checkpoint', cp, key: `${route.id}:${cp.id}` });
+    }
+    routeAnchors.push({ routeId: route.id, routeName: route.name, step: route.totalSteps, kind: 'goal', cp: lastPhoto, key: `${route.id}:goal` });
+    routeAnchors.sort((a, b) => a.step - b.step);
+    anchors.push(...routeAnchors);
+  }
+
+  const uf = unionFind(anchors.length);
+  for (let i = 0; i < anchors.length; i += 1) {
+    const a = anchors[i];
+    if (!a.cp) continue;
+    for (let j = i + 1; j < anchors.length; j += 1) {
+      const b = anchors[j];
+      if (!b.cp || a.routeId === b.routeId) continue;
+      const sim = checkpointPairSimilarity(a.cp, b.cp);
+      const threshold = sim.source === 'ai' ? GRAPH_AI_THRESHOLD : GRAPH_DESCRIPTOR_THRESHOLD;
+      if (sim.score >= threshold) uf.join(i, j);
+    }
+  }
+
+  const groups = new Map();
+  for (let i = 0; i < anchors.length; i += 1) {
+    const root = uf.find(i);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push({ ...anchors[i], anchorIndex: i });
+  }
+
+  const nodes = [];
+  const anchorToNode = new Map();
+  let idx = 1;
+  for (const members of groups.values()) {
+    const node = {
+      id: `N${idx++}`,
+      members,
+      label: members.length > 1
+        ? `共通地点 ${members.map((m) => m.routeName).filter((v, i, a) => a.indexOf(v) === i).join(' / ')}`
+        : `${members[0].routeName} ${members[0].kind === 'start' ? 'START' : members[0].kind === 'goal' ? 'GOAL' : `${members[0].step}歩`}`,
+    };
+    nodes.push(node);
+    for (const m of members) anchorToNode.set(m.key, node.id);
+  }
+
+  const edges = [];
+  for (const route of routes) {
+    const ra = anchors.filter((a) => a.routeId === route.id).sort((a, b) => a.step - b.step);
+    for (let i = 0; i < ra.length - 1; i += 1) {
+      const from = anchorToNode.get(ra[i].key), to = anchorToNode.get(ra[i + 1].key);
+      if (!from || !to || from === to) continue;
+      edges.push({
+        id: `${route.id}:${i}`,
+        from, to,
+        cost: Math.max(1, ra[i + 1].step - ra[i].step),
+        routeId: route.id,
+        routeName: route.name,
+        fromStep: ra[i].step,
+        toStep: ra[i + 1].step,
+      });
+    }
+  }
+
+  state.graph = { nodes, edges, builtAt: Date.now(), ai: state.ai.status === 'ready' };
+  renderGraph();
+}
+
+function shortestGraphPath(from, to) {
+  const { nodes, edges } = state.graph;
+  if (!from || !to) return null;
+  const dist = new Map(nodes.map((n) => [n.id, Infinity]));
+  const prev = new Map();
+  const prevEdge = new Map();
+  const unvisited = new Set(nodes.map((n) => n.id));
+  dist.set(from, 0);
+
+  while (unvisited.size) {
+    let u = null, best = Infinity;
+    for (const id of unvisited) {
+      const d = dist.get(id);
+      if (d < best) { best = d; u = id; }
+    }
+    if (u == null || best === Infinity) break;
+    unvisited.delete(u);
+    if (u === to) break;
+    for (const e of edges) {
+      let v = null;
+      if (e.from === u) v = e.to;
+      else if (e.to === u) v = e.from;
+      if (!v || !unvisited.has(v)) continue;
+      const alt = best + e.cost;
+      if (alt < dist.get(v)) {
+        dist.set(v, alt); prev.set(v, u); prevEdge.set(v, e);
+      }
+    }
+  }
+  if (!Number.isFinite(dist.get(to))) return null;
+  const nodePath = [];
+  const edgePath = [];
+  let cur = to;
+  while (cur) {
+    nodePath.push(cur);
+    if (cur === from) break;
+    edgePath.push(prevEdge.get(cur));
+    cur = prev.get(cur);
+  }
+  nodePath.reverse(); edgePath.reverse();
+  return { nodePath, edgePath, cost: dist.get(to) };
+}
+
+function renderGraph() {
+  const graph = state.graph || { nodes: [], edges: [] };
+  if (!$('graphNodeCount')) return;
+  $('graphNodeCount').textContent = String(graph.nodes.length || 0);
+  $('graphEdgeCount').textContent = String(graph.edges.length || 0);
+  $('graphStatus').textContent = graph.builtAt
+    ? `${new Date(graph.builtAt).toLocaleTimeString('ja-JP')} 構築。${graph.ai ? 'MobileNet Embedding優先。' : '軽量画像特徴でクラスタリング。'}`
+    : '未構築。';
+
+  const fill = (select) => {
+    const prev = select.value;
+    select.innerHTML = '<option value="">選択</option>';
+    for (const node of graph.nodes) {
+      const o = document.createElement('option'); o.value = node.id; o.textContent = `${node.id}: ${node.label}`; select.appendChild(o);
+    }
+    if (graph.nodes.some((n) => n.id === prev)) select.value = prev;
+  };
+  fill($('graphFrom')); fill($('graphTo'));
+
+  const list = $('graphNodesList'); list.innerHTML = '';
+  for (const node of graph.nodes) {
+    const el = document.createElement('div'); el.className = 'graph-node';
+    const members = node.members.map((m) => `${m.routeName} @ ${m.step}歩${m.cp ? ' 📷' : ''}`).join('<br>');
+    el.innerHTML = `<div class="graph-node-title">${node.id}: ${node.label}</div><div class="graph-node-meta">${node.members.length} anchor(s)</div><div class="graph-members">${members}</div>`;
+    list.appendChild(el);
+  }
+  if (!graph.nodes.length) list.innerHTML = '<div class="card"><div class="note">グラフはまだありません。</div></div>';
+}
+
+function calculateGraphPathUI() {
+  const result = shortestGraphPath($('graphFrom').value, $('graphTo').value);
+  if (!result) { $('graphPathResult').textContent = '到達できる経路がありません。共通地点となるチェックポイントを増やしてください。'; return; }
+  const segments = result.edgePath.map((e) => `${e.routeName}: ${e.cost}歩`).join(' → ');
+  $('graphPathResult').textContent = `推定合計 ${result.cost}歩 ｜ ${result.nodePath.join(' → ')}${segments ? ` ｜ ${segments}` : ''}`;
+}
+
+function switchView(name) {
+  document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  $(`view-${name}`).classList.add('active');
+  if (name === 'routes') refreshRoutes();
+  if (name === 'nav') renderNav();
+  if (name === 'graph') renderGraph();
+  window.scrollTo({ top: 0, behavior: 'instant' });
+}
+
+function bindUI() {
+  document.querySelectorAll('nav button').forEach((button) => { button.onclick = () => switchView(button.dataset.view); });
+  $('btnPermission').onclick = requestSensors;
+  $('btnCalibration').onclick = toggleCalibration;
+  $('btnResetCalibration').onclick = resetCalibration;
+  $('threshold').value = String(state.detector.threshold);
+  $('thresholdLabel').textContent = state.detector.threshold.toFixed(2);
+  $('threshold').oninput = () => {
+    state.detector.threshold = parseFloat($('threshold').value);
+    localStorage.setItem('visualRoute.stepThreshold', String(state.detector.threshold));
+    $('thresholdLabel').textContent = state.detector.threshold.toFixed(2);
+  };
+  $('btnStartRecord').onclick = startRecording;
+  $('btnCapture').onclick = captureCamera;
+  $('btnCloseCamera').onclick = closeCamera;
+  $('btnStartNav').onclick = startNavigation;
+  $('btnVisualMatch').onclick = () => openCamera('visual-match');
+  $('btnApplyMatch').onclick = applyVisualMatch;
+  $('navRouteSelect').onchange = () => loadNavRoute($('navRouteSelect').value);
+  $('btnResumeMeasurement').onclick = resumeMeasurement;
+  $('btnExport').onclick = exportBackup;
+  $('btnImport').onclick = () => $('importFile').click();
+  $('importFile').onchange = async () => { const file = $('importFile').files?.[0]; if (file) await importBackup(file); $('importFile').value = ''; };
+  $('btnLoadAI').onclick = () => loadAIModel().catch(() => {});
+  $('btnLoadAIGraph').onclick = () => loadAIModel().then(renderGraph).catch(() => {});
+  $('btnBuildGraph').onclick = () => buildRouteGraph().catch((e) => { $('graphStatus').textContent = `構築エラー: ${e?.message || e}`; });
+  $('btnGraphPath').onclick = calculateGraphPathUI;
+  document.addEventListener('visibilitychange', handleVisibility);
+  window.addEventListener('pagehide', () => pauseMeasurement('ページが非表示になりました。戻ったら「計測を再開」を押してください。'));
+  window.addEventListener('resize', () => { drawBelief(); });
+}
+
+async function init() {
+  bindUI();
+  if (!window.isSecureContext) $('secureWarning').hidden = false;
+  if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('./sw.js?v=3.0.0').catch(() => {});
+  setInterval(() => { if (state.recording) renderLive(); }, 500);
+  try { await openDB(); await refreshRoutes(); } catch (error) { console.error(error); }
+  renderAIStatus();
+  renderLive(); renderNav(); renderCompassQuality(); renderGraph();
 }
 
 init();
