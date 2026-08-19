@@ -6,96 +6,181 @@
 <meta name="theme-color" content="#0b1018">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>Visual Route Lab</title>
-<style>
-:root{color-scheme:dark;--bg:#0b1018;--panel:#131b27;--line:#29364a;--text:#f4f7fb;--muted:#94a1b4;--accent:#4d91ff;--danger:#d5535d;--good:#55b96d;--warn:#efbd66}
-*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic",sans-serif}body{padding-bottom:calc(72px + env(safe-area-inset-bottom))}
-header{position:sticky;top:0;z-index:20;background:rgba(11,16,24,.94);backdrop-filter:blur(14px);border-bottom:1px solid var(--line);padding:calc(12px + env(safe-area-inset-top)) 16px 11px}.title{font-size:19px;font-weight:800}.sub{font-size:11px;color:var(--muted)}
-main{max-width:760px;margin:auto;padding:16px}.view{display:none}.view.active{display:block}h1{font-size:27px;margin:0 0 7px}.lead{color:#b5c0d0;line-height:1.55;margin:0 0 16px}
-.card,.metric{background:var(--panel);border:1px solid var(--line);border-radius:14px}.card{padding:14px;margin-bottom:12px}.card h2{font-size:16px;margin:0 0 9px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}.metric{padding:13px}.ml{font-size:11px;color:var(--muted);font-weight:700}.mv{font-size:25px;font-weight:800;margin-top:3px}.ms{font-size:10px;color:#758399;margin-top:3px}
-.note{font-size:12px;color:var(--muted);line-height:1.55}.box{border-radius:12px;padding:12px 13px;margin-bottom:12px;font-size:13px;line-height:1.55}.warn{background:#241d12;border:1px solid #5b4726;color:#f3d69e}.error{background:#27151a;border:1px solid #63323a;color:#ffbdc2}.goodbox{background:#112119;border:1px solid #285e38;color:#afe3bb}
-.btn{width:100%;border:0;border-radius:12px;padding:14px 13px;margin-bottom:10px;background:var(--accent);color:white;font-weight:800}.btn.secondary{background:transparent;border:1px solid #43526a;color:#dfe8f5}.btn.danger{background:var(--danger)}.btn.good{background:#2c8e4c}.btn:disabled{opacity:.4}.row{display:flex;gap:8px}.row>*{flex:1}
-label{display:block;font-size:11px;color:var(--muted);font-weight:700;margin-bottom:5px}input[type=text],select{width:100%;border:1px solid #3b4960;background:#0e151f;color:#fff;border-radius:10px;padding:11px}input[type=range]{width:100%}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#d6e2f4;line-height:1.6;font-size:13px}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#778497;margin-right:6px}.dot.ok{background:var(--good)}.route{padding:13px;border:1px solid var(--line);border-radius:12px;background:#101721;margin-bottom:10px}.route-title{font-weight:800;font-size:17px}.route-meta{font-size:11px;color:var(--muted);margin:4px 0 9px}.pills{display:flex;gap:6px;flex-wrap:wrap;margin:7px 0}.pill{font-size:10px;background:#0b111a;border:1px solid #2c394d;color:#adb9c9;padding:5px 7px;border-radius:8px}
-.progress{height:12px;background:#0b1119;border-radius:999px;overflow:hidden;margin:10px 0}.progress>div{height:100%;background:var(--accent);width:0}.canvas-wrap{background:#0d141e;border:1px solid var(--line);border-radius:12px;padding:8px;margin:10px 0;text-align:center}canvas{width:100%;max-width:340px;aspect-ratio:1;background:#0b1118;border-radius:9px}.turn{font-weight:800;color:#f0c477;margin-top:8px}.kv{display:grid;grid-template-columns:auto 1fr;gap:5px 12px;font-size:13px}.kv div:nth-child(odd){color:var(--muted)}
-.checks{display:flex;gap:8px;overflow:auto;padding:4px 0}.check{min-width:104px}.check img{width:104px;height:78px;object-fit:cover;border-radius:8px;background:#090d13}.check div{font-size:10px;color:var(--muted);text-align:center;margin-top:2px}
-nav{position:fixed;left:0;right:0;bottom:0;z-index:30;display:grid;grid-template-columns:repeat(4,1fr);background:rgba(8,12,18,.96);backdrop-filter:blur(15px);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}nav button{border:0;background:transparent;color:#778397;padding:13px 4px;font-weight:800;font-size:12px}nav button.active{color:#e8f0ff;border-top:2px solid var(--accent)}
-.modal{display:none;position:fixed;inset:0;z-index:50;background:#000}.modal.active{display:flex;flex-direction:column}.video-wrap{flex:1;min-height:0;display:flex;align-items:center;justify-content:center}video{width:100%;height:100%;object-fit:cover}.controls{padding:14px;background:#0b1018;padding-bottom:calc(14px + env(safe-area-inset-bottom))}.match{font-size:20px;font-weight:800;margin:8px 0}.match.good{color:#8fdfa1}.match.weak{color:#efc577}
-</style>
+<meta name="apple-mobile-web-app-title" content="Visual Route">
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="stylesheet" href="./style.css?v=2.0.0">
+<title>Visual Route Lab v2</title>
 </head>
 <body>
-<header><div class="title">Visual Route Lab</div><div class="sub">Safari / Mapless / no Expo / no npm</div></header>
+<header>
+  <div class="header-title">Visual Route Lab <span class="version">v2.0</span></div>
+  <div class="header-sub">Mapless indoor route localization / Safari only</div>
+</header>
+
+<div id="resumeBanner" class="resume-banner" hidden>
+  <div><strong>計測を一時停止しました</strong><br><span id="resumeReason">Safariが非表示になりました。</span></div>
+  <button id="btnResumeMeasurement" class="mini-btn">計測を再開</button>
+</div>
+
 <main>
-<div id="secureWarning" class="box error" hidden><strong>HTTPSが必要です。</strong><br>カメラを使うため、ファイル直開きではなくGitHub Pages等のHTTPS URLからSafariで開いてください。</div>
+  <div id="secureWarning" class="box error" hidden>
+    <strong>HTTPSが必要です。</strong><br>
+    GitHub PagesのHTTPS URLからSafariで開いてください。
+  </div>
 
-<section id="view-record" class="view active">
-<h1>ルート登録</h1><p class="lead">加速度から歩数を自前推定し、方角・端末姿勢・写真チェックポイントと一緒に保存します。</p>
-<div id="permissionBox" class="box warn">最初にセンサー許可が必要です。</div>
-<button id="permit" class="btn good">① センサーを許可</button>
-<div class="card"><h2>センサー状態</h2><div><span id="motionDot" class="dot"></span><span id="motionStatus">DeviceMotion: 未接続</span></div><div><span id="orientDot" class="dot"></span><span id="orientStatus">方角: 未接続</span></div><hr style="border:0;border-top:1px solid var(--line);margin:12px 0"><label>歩数検出しきい値 <span id="thLabel">1.10</span> m/s²</label><input id="threshold" type="range" min="0.55" max="2.20" step="0.05" value="1.10"><div class="note">誤検出が多い→上げる。歩いても数えない→下げる。</div></div>
-<div class="metrics"><div class="metric"><div class="ml">推定歩数</div><div id="recordSteps" class="mv">0</div><div class="ms">START以降</div></div><div class="metric"><div class="ml">方角</div><div id="heading" class="mv">--°</div><div class="ms">北=0°</div></div><div class="metric"><div class="ml">動的加速度</div><div id="dyn" class="mv">0.00</div><div class="ms">step detector</div></div><div class="metric"><div class="ml">経過</div><div id="elapsed" class="mv">0:00</div><div class="ms">recording</div></div></div>
-<div class="card"><label>ルート名</label><input id="routeName" type="text" value="玄関→目的地"></div>
-<div id="recordButtons"><button id="startRecord" class="btn">② START ルート記録</button></div>
-<div class="card"><h2>端末姿勢</h2><div class="mono">alpha <span id="alpha">--</span>°<br>beta&nbsp; <span id="beta">--</span>°<br>gamma <span id="gamma">--</span>°</div><div class="note">記録時と再走行時はなるべく似た持ち方にしてください。</div></div>
-</section>
+  <section id="view-record" class="view active">
+    <h1>ルート登録</h1>
+    <p class="lead">歩数・相対方角・曲がり角・画像チェックポイントを記録します。絶対方角ではなく「START時の向き=0°」を基準にするため、磁気オフセットの影響を減らしています。</p>
 
-<section id="view-routes" class="view"><h1>保存ルート</h1><p class="lead">ルートと画像はSafariのIndexedDBに保存します。</p><div id="routesList"></div></section>
+    <div id="permissionBox" class="box warn">最初にセンサー許可が必要です。</div>
+    <button id="btnPermission" class="btn good">① センサーを許可</button>
 
-<section id="view-nav" class="view">
-<h1>簡易ナビ</h1><p class="lead">歩数ベースでは同じSTART地点から再走行します。画像チェックポイントが一致すれば途中位置への補正も試せます。</p>
-<div class="card"><label>対象ルート</label><select id="navSelect"><option value="">ルートを選択</option></select></div>
-<div class="metrics"><div class="metric"><div class="ml">ナビ歩数</div><div id="navSteps" class="mv">0</div><div class="ms">補正後</div></div><div class="metric"><div class="ml">進捗</div><div id="navProgress" class="mv">0%</div><div class="ms">route position</div></div></div>
-<div class="card"><div class="progress"><div id="progressBar"></div></div><div class="kv"><div>現在方角</div><div id="navHead">--°</div><div>登録時近傍</div><div id="recHead">--°</div><div>方角差</div><div id="headDiff">--°</div><div>画像補正</div><div id="offset">なし</div></div><div id="nextTurn" class="turn">ルートを選択してください</div></div>
-<div class="canvas-wrap"><canvas id="navCanvas" width="340" height="340"></canvas><div class="note">仮歩幅0.70mで描く相対軌跡。実寸地図ではありません。</div></div>
-<div id="navButtons"><button id="startNav" class="btn">同じSTART地点からナビ開始</button><button id="visualMatch" class="btn secondary">画像で現在地点を補正</button></div>
-<div id="matchResult" class="card" hidden><h2>画像照合結果</h2><div id="matchScore" class="match">--</div><div id="matchDetail" class="note"></div><button id="applyMatch" class="btn good" hidden>この地点へ補正する</button></div>
-</section>
+    <div class="card">
+      <h2>センサー状態</h2>
+      <div><span id="motionDot" class="dot"></span><span id="motionStatus">DeviceMotion: 未接続</span></div>
+      <div><span id="orientDot" class="dot"></span><span id="orientStatus">方角: 未接続</span></div>
+      <div><span id="compassQualityDot" class="dot"></span><span id="compassQuality">方角品質: 未判定</span></div>
+      <div class="divider"></div>
+      <label>歩数検出しきい値 <span id="thresholdLabel">1.10</span> m/s²</label>
+      <input id="threshold" type="range" min="0.35" max="2.80" step="0.05" value="1.10">
+      <div class="note">通常は「20歩キャリブレーション」で自動調整してください。</div>
+      <div class="row top-gap">
+        <button id="btnCalibration" class="btn secondary">20歩キャリブレーション</button>
+        <button id="btnResetCalibration" class="btn secondary">初期値に戻す</button>
+      </div>
+      <div id="calibrationResult" class="small"></div>
+    </div>
 
-<section id="view-info" class="view"><h1>仕様・制約</h1><div class="card"><h2>不要なもの</h2><div class="kv"><div>Expo</div><div>不要</div><div>npm / Node</div><div>不要</div><div>Xcode / Mac</div><div>不要</div><div>Developer登録</div><div>不要</div><div>外部AI API</div><div>不要</div></div></div><div class="card"><h2>重要な制約</h2><div class="note">ARKit/SLAMではありません。歩数は加速度からの推定です。方角は磁気環境と持ち方の影響を受けます。画像照合は深層学習ではなく簡易特徴量です。絶対座標(x,y,z)やセンチメートル精度は出ません。</div></div></section>
+    <div class="metrics">
+      <div class="metric"><div class="metric-label">推定歩数</div><div id="recordSteps" class="metric-value">0</div><div class="metric-sub">START以降</div></div>
+      <div class="metric"><div class="metric-label">相対方角</div><div id="relativeHeading" class="metric-value">--°</div><div class="metric-sub">START向き=0°</div></div>
+      <div class="metric"><div class="metric-label">動的加速度</div><div id="dynamicAcc" class="metric-value">0.00</div><div class="metric-sub">平滑化済み</div></div>
+      <div class="metric"><div class="metric-label">経過</div><div id="elapsed" class="metric-value">0:00</div><div class="metric-sub">recording</div></div>
+    </div>
+
+    <div class="card">
+      <label>ルート名</label>
+      <input id="routeName" type="text" value="玄関→目的地" autocomplete="off">
+    </div>
+
+    <div id="recordButtons"><button id="btnStartRecord" class="btn">② START ルート記録</button></div>
+
+    <div class="card">
+      <h2>端末姿勢・コンパス</h2>
+      <div class="kv">
+        <div>絶対方角</div><div id="absoluteHeading">--°</div>
+        <div>Compass accuracy</div><div id="compassAccuracy">--</div>
+        <div>alpha</div><div id="alpha">--°</div>
+        <div>beta</div><div id="beta">--°</div>
+        <div>gamma</div><div id="gamma">--°</div>
+      </div>
+      <div class="note top-gap">記録時とナビ時は、スマホを身体の前でなるべく似た姿勢にしてください。</div>
+    </div>
+  </section>
+
+  <section id="view-routes" class="view">
+    <h1>保存ルート</h1>
+    <p class="lead">ルートと写真はSafariのIndexedDBに保存します。消失対策としてバックアップ書き出しもできます。</p>
+    <div class="card">
+      <h2>バックアップ</h2>
+      <div class="row">
+        <button id="btnExport" class="btn secondary">バックアップ書き出し</button>
+        <button id="btnImport" class="btn secondary">バックアップ復元</button>
+      </div>
+      <input id="importFile" type="file" accept="application/json,.json" hidden>
+      <div id="storageInfo" class="small">ストレージ使用量を確認中…</div>
+    </div>
+    <div id="routesList"></div>
+  </section>
+
+  <section id="view-nav" class="view">
+    <h1>簡易ナビ</h1>
+    <p class="lead">歩数だけでなく、相対方角・曲がり角で自動補正します。さらに画像チェックポイントで途中地点へ再ローカライズできます。</p>
+
+    <div class="card">
+      <label>対象ルート</label>
+      <select id="navRouteSelect"><option value="">ルートを選択</option></select>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="metric-label">推定地点</div><div id="navSteps" class="metric-value">0歩</div><div class="metric-sub">補正後</div></div>
+      <div class="metric"><div class="metric-label">進捗</div><div id="navProgressValue" class="metric-value">0%</div><div class="metric-sub">route position</div></div>
+      <div class="metric"><div class="metric-label">信頼度</div><div id="navConfidence" class="metric-value confidence-medium">--</div><div class="metric-sub">複数情報から評価</div></div>
+      <div class="metric"><div class="metric-label">相対方角</div><div id="navRelativeHeading" class="metric-value">--°</div><div class="metric-sub">NAV開始向き=0°</div></div>
+    </div>
+
+    <div class="card">
+      <div class="progress"><div id="navProgressBar"></div></div>
+      <div class="kv">
+        <div>生の歩数</div><div id="navRawSteps">0</div>
+        <div>登録近傍方角</div><div id="navRecordedHeading">--°</div>
+        <div>方角差</div><div id="navHeadingDiff">--°</div>
+        <div>曲がり補正</div><div id="turnCorrectionLabel">なし</div>
+        <div>画像補正</div><div id="visualCorrectionLabel">なし</div>
+      </div>
+      <div id="nextTurn" class="turn">ルートを選択してください</div>
+    </div>
+
+    <div class="canvas-wrap">
+      <canvas id="navCanvas" width="340" height="340"></canvas>
+      <div class="small">START方向を上として描く相対軌跡。仮歩幅0.70mであり実寸地図ではありません。</div>
+    </div>
+
+    <div id="navButtons">
+      <button id="btnStartNav" class="btn">同じSTART地点からナビ開始</button>
+      <button id="btnVisualMatch" class="btn secondary">画像で現在地点を補正</button>
+    </div>
+
+    <div id="matchResult" class="card" hidden>
+      <h2>画像照合結果</h2>
+      <div id="matchScore" class="match">--</div>
+      <div id="matchDetail" class="note"></div>
+      <button id="btnApplyMatch" class="btn good" hidden>この地点へ補正する</button>
+    </div>
+  </section>
+
+  <section id="view-info" class="view">
+    <h1>仕様・課題</h1>
+    <div class="card">
+      <h2>V2で対応した課題</h2>
+      <ul class="compact-list">
+        <li>20歩キャリブレーションで歩数しきい値を自動調整</li>
+        <li>歩数検出を単純なしきい値交差から「平滑化＋局所ピーク」に改善</li>
+        <li>絶対コンパスではなくSTART基準の相対方角を使用</li>
+        <li>曲がり角アンカーで歩数ドリフトを自動補正</li>
+        <li>画像特徴量を高密度化し、第2候補との差も見て誤一致を抑制</li>
+        <li>写真の暗さ・コントラスト・エッジ量を品質判定</li>
+        <li>Safariが非表示になったら計測を止め、復帰後に明示再開</li>
+        <li>対応端末ではScreen Wake Lockで画面消灯を抑制</li>
+        <li>IndexedDBデータのJSONバックアップ/復元</li>
+        <li>Service Workerをnetwork-first化し、更新が古いキャッシュに張り付く問題を軽減</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>残る制約</h2>
+      <div class="note">
+        ARKit/SLAMではありません。絶対座標(x,y,z)は出ません。加速度ベース歩数は歩き方・持ち方で誤差が出ます。相対方角も磁気ドリフトの影響は残ります。画像照合は深層学習ではないため、似た廊下・大きな視点差・照明差には弱いです。
+      </div>
+    </div>
+  </section>
 </main>
-<nav><button data-view="record" class="active">登録</button><button data-view="routes">ルート</button><button data-view="nav">ナビ</button><button data-view="info">仕様</button></nav>
 
-<div id="camera" class="modal"><div class="video-wrap"><video id="video" playsinline autoplay muted></video></div><div class="controls"><div id="cameraHelp" class="note" style="margin-bottom:10px"></div><button id="capture" class="btn">撮影</button><button id="closeCamera" class="btn secondary">キャンセル</button></div></div>
+<nav>
+  <button data-view="record" class="active">登録</button>
+  <button data-view="routes">ルート</button>
+  <button data-view="nav">ナビ</button>
+  <button data-view="info">仕様</button>
+</nav>
 
-<script>
-(()=>{'use strict';
-const $=id=>document.getElementById(id), clamp=(v,a,b)=>Math.max(a,Math.min(b,v)), norm=d=>((d%360)+360)%360;
-const adiff=(a,b)=>{let d=Math.abs(norm(a)-norm(b));return d>180?360-d:d};
-const ftime=ms=>{const s=Math.max(0,Math.floor(ms/1000));return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`};
-const st={granted:false,heading:null,ori:{alpha:null,beta:null,gamma:null},dyn:0,det:{g:9.81,last:0,lastStep:0,th:1.10,refr:300},recording:false,rsteps:0,startAt:0,events:[],checks:[],nav:false,nraw:0,noffset:0,route:null,candidate:null,stream:null,camMode:null};
-let dbp=null;
-function db(){if(dbp)return dbp;dbp=new Promise((res,rej)=>{const q=indexedDB.open('visual-route-web-v1',1);q.onupgradeneeded=()=>{if(!q.result.objectStoreNames.contains('routes'))q.result.createObjectStore('routes',{keyPath:'id'})};q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)});return dbp}
-async function getRoutes(){const d=await db();return new Promise((res,rej)=>{const tx=d.transaction('routes','readonly'),q=tx.objectStore('routes').getAll();q.onsuccess=()=>res(q.result||[]);q.onerror=()=>rej(q.error)})}
-async function putRoute(r){const d=await db();return new Promise((res,rej)=>{const tx=d.transaction('routes','readwrite');tx.objectStore('routes').put(r);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
-async function delRoute(id){const d=await db();return new Promise((res,rej)=>{const tx=d.transaction('routes','readwrite');tx.objectStore('routes').delete(id);tx.oncomplete=res;tx.onerror=()=>rej(tx.error)})}
-function dot(id,ok){$(id).classList.toggle('ok',ok)}
-function onOri(e){let h=null;if(typeof e.webkitCompassHeading==='number')h=norm(e.webkitCompassHeading);else if(typeof e.alpha==='number')h=norm(360-e.alpha);if(h!==null)st.heading=h;st.ori={alpha:e.alpha,beta:e.beta,gamma:e.gamma};dot('orientDot',true);$('orientStatus').textContent='方角: 受信中';live()}
-function onMotion(e){const a=e.accelerationIncludingGravity;if(!a||[a.x,a.y,a.z].some(v=>typeof v!=='number'))return;const m=Math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z);st.det.g=.92*st.det.g+.08*m;const dyn=Math.abs(m-st.det.g);st.dyn=dyn;dot('motionDot',true);$('motionStatus').textContent='DeviceMotion: 受信中';const now=performance.now();if(dyn>=st.det.th&&st.det.last<st.det.th&&now-st.det.lastStep>=st.det.refr){st.det.lastStep=now;step()}st.det.last=dyn;live()}
-function step(){if(st.recording){st.rsteps++;st.events.push({t:Date.now(),steps:st.rsteps,heading:st.heading,ori:{...st.ori}})}if(st.nav)st.nraw++;live();renderNav()}
-async function permit(){try{let ok=true;if(typeof DeviceMotionEvent!=='undefined'&&typeof DeviceMotionEvent.requestPermission==='function')ok=(await DeviceMotionEvent.requestPermission())==='granted'&&ok;if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function')ok=(await DeviceOrientationEvent.requestPermission())==='granted'&&ok;if(!ok)throw new Error('権限が拒否されました');addEventListener('devicemotion',onMotion,{passive:true});addEventListener('deviceorientation',onOri,{passive:true});st.granted=true;$('permissionBox').className='box goodbox';$('permissionBox').textContent='センサー許可済み。iPhoneを少し動かして値を確認してください。';$('permit').disabled=true;$('permit').textContent='センサー許可済み'}catch(e){$('permissionBox').className='box error';$('permissionBox').textContent='開始できません: '+e.message}}
-function live(){$('recordSteps').textContent=st.rsteps;$('heading').textContent=st.heading==null?'--°':`${st.heading.toFixed(0)}°`;$('dyn').textContent=st.dyn.toFixed(2);for(const k of ['alpha','beta','gamma']){$(k).textContent=typeof st.ori[k]==='number'?st.ori[k].toFixed(1):'--'}if(st.recording)$('elapsed').textContent=ftime(Date.now()-st.startAt)}
-function startRecord(){if(!st.granted){alert('先にセンサーを許可してください。');return}st.recording=true;st.rsteps=0;st.startAt=Date.now();st.events=[{t:Date.now(),steps:0,heading:st.heading,ori:{...st.ori}}];st.checks=[];$('recordButtons').innerHTML='<button id="stopRecord" class="btn danger">STOP 保存</button><button id="checkpoint" class="btn secondary">現在地点を写真で記録</button>';$('stopRecord').onclick=stopRecord;$('checkpoint').onclick=()=>openCamera('checkpoint')}
-function turns(events){const out=[];if(!events.length)return out;let anchor=events[0].heading,lastStep=0;for(const e of events){if(e.heading==null||anchor==null){anchor=e.heading??anchor;continue}const d=adiff(e.heading,anchor);if(d>=45&&e.steps-lastStep>=3){out.push({steps:e.steps,heading:e.heading,diff:d});anchor=e.heading;lastStep=e.steps}}return out}
-async function stopRecord(){st.recording=false;if(st.rsteps<3){alert('歩数が少なすぎるため保存しません。');resetRecord();return}const r={id:'route-'+Date.now(),name:$('routeName').value.trim()||'無題ルート',createdAt:new Date().toISOString(),durationMs:Date.now()-st.startAt,totalSteps:st.rsteps,strideM:.70,events:st.events,turns:turns(st.events),checkpoints:st.checks};await putRoute(r);alert(`保存しました\n${r.name}\n${r.totalSteps}歩 / 写真${r.checkpoints.length}枚`);resetRecord();refresh()}
-function resetRecord(){st.recording=false;st.rsteps=0;st.events=[];st.checks=[];$('elapsed').textContent='0:00';$('recordButtons').innerHTML='<button id="startRecord" class="btn">② START ルート記録</button>';$('startRecord').onclick=startRecord;live()}
-async function openCamera(mode){if(!window.isSecureContext){alert('カメラにはHTTPSが必要です。');return}try{st.camMode=mode;st.stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});$('video').srcObject=st.stream;$('camera').classList.add('active');$('cameraHelp').textContent=mode==='checkpoint'?`記録中 ${st.rsteps}歩地点。固定物を中心に撮影してください。`:'登録時のチェックポイントに近い構図で撮影してください。'}catch(e){alert('カメラを開始できません: '+e.message)}}
-function closeCamera(){$('camera').classList.remove('active');if(st.stream){st.stream.getTracks().forEach(t=>t.stop());st.stream=null}$('video').srcObject=null}
-async function snap(){const v=$('video');if(v.videoWidth<2)await new Promise(r=>setTimeout(r,250));const max=640,s=Math.min(1,max/v.videoWidth),w=Math.max(1,Math.round(v.videoWidth*s)),h=Math.max(1,Math.round(v.videoHeight*s)),c=document.createElement('canvas');c.width=w;c.height=h;c.getContext('2d').drawImage(v,0,0,w,h);const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',.72));return{blob,desc:descriptor(c)}}
-function descriptor(c){const s=document.createElement('canvas');s.width=8;s.height=8;const x=s.getContext('2d',{willReadFrequently:true});x.drawImage(c,0,0,8,8);const d=x.getImageData(0,0,8,8).data,lum=[],R=Array(16).fill(0),G=Array(16).fill(0),B=Array(16).fill(0);for(let i=0;i<d.length;i+=4){const r=d[i],g=d[i+1],b=d[i+2];lum.push(.2126*r+.7152*g+.0722*b);R[Math.min(15,r>>4)]++;G[Math.min(15,g>>4)]++;B[Math.min(15,b>>4)]++}const mean=lum.reduce((a,b)=>a+b,0)/lum.length,sd=Math.sqrt(lum.reduce((q,v)=>q+(v-mean)**2,0)/lum.length)||1,n=h=>{const sum=h.reduce((a,b)=>a+b,0)||1;return h.map(v=>v/sum)};return{lum:lum.map(v=>(v-mean)/sd),r:n(R),g:n(G),b:n(B)}}
-function cosine(a,b){let dot=0,aa=0,bb=0;for(let i=0;i<a.length;i++){dot+=a[i]*b[i];aa+=a[i]*a[i];bb+=b[i]*b[i]}return dot/(Math.sqrt(aa*bb)||1)}
-function sim(a,b){return clamp(.65*((cosine(a.lum,b.lum)+1)/2)+.35*((cosine(a.r,b.r)+cosine(a.g,b.g)+cosine(a.b,b.b))/3),0,1)}
-async function capture(){const s=await snap();if(st.camMode==='checkpoint'){if(st.recording)st.checks.push({id:'cp-'+Date.now(),steps:st.rsteps,heading:st.heading,blob:s.blob,descriptor:s.desc});closeCamera();alert(`${st.rsteps}歩地点の写真を保存しました。`)}else{closeCamera();match(s.desc)}}
-function match(desc){if(!st.route?.checkpoints?.length){alert('このルートには写真がありません。');return}let best=null;for(const cp of st.route.checkpoints){if(!cp.descriptor)continue;const score=sim(desc,cp.descriptor);if(!best||score>best.score)best={cp,score}}if(!best)return;st.candidate=best;$('matchResult').hidden=false;$('matchScore').textContent=`類似度 ${(best.score*100).toFixed(0)}%`;$('matchScore').className='match '+(best.score>=.72?'good':'weak');$('matchDetail').textContent=`最も近い登録画像: ${best.cp.steps}歩地点。`+(best.score>=.72?' 補正候補として比較的強い一致です。':' 一致が弱めです。構図を合わせて再撮影してください。');$('applyMatch').hidden=best.score<.62}
-function applyMatch(){if(!st.candidate)return;st.noffset=st.candidate.cp.steps-st.nraw;$('offset').textContent=`${st.noffset>=0?'+':''}${st.noffset}歩`;renderNav()}
-function routePoints(r){const p=[{x:0,y:0,steps:0}];let x=0,y=0;for(const e of r?.events||[]){if(!e.steps)continue;const h=(typeof e.heading==='number'?e.heading:0)*Math.PI/180;x+=Math.sin(h)*(r.strideM||.7);y-=Math.cos(h)*(r.strideM||.7);p.push({x,y,steps:e.steps})}return p}
-function draw(c,r,progress=null){const ctx=c.getContext('2d');ctx.fillStyle='#0b1118';ctx.fillRect(0,0,c.width,c.height);const p=routePoints(r);if(p.length<2)return;const xs=p.map(q=>q.x),ys=p.map(q=>q.y),minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys),rx=Math.max(.5,maxX-minX),ry=Math.max(.5,maxY-minY),pad=28,u=c.width-pad*2,sc=Math.min(u/rx,u/ry),xy=q=>({x:pad+(q.x-minX)*sc+(u-rx*sc)/2,y:pad+(q.y-minY)*sc+(u-ry*sc)/2});ctx.strokeStyle='#596a82';ctx.lineWidth=3;ctx.beginPath();p.forEach((q,i)=>{q=xy(q);i?ctx.lineTo(q.x,q.y):ctx.moveTo(q.x,q.y)});ctx.stroke();const d=(q,col,r)=>{q=xy(q);ctx.fillStyle=col;ctx.beginPath();ctx.arc(q.x,q.y,r,0,Math.PI*2);ctx.fill()};d(p[0],'#62c77a',7);d(p.at(-1),'#efb85e',7);if(progress!=null)d(p[clamp(Math.round(progress*(p.length-1)),0,p.length-1)],'#4d91ff',8);ctx.fillStyle='#7b899c';ctx.font='bold 12px -apple-system';ctx.fillText('N',c.width-22,18)}
-async function refresh(){const rs=(await getRoutes()).sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt))),list=$('routesList');list.innerHTML='';if(!rs.length)list.innerHTML='<div class="card"><div class="note">まだルートがありません。</div></div>';for(const r of rs){const d=document.createElement('div');d.className='route';d.innerHTML='<div class="route-title"></div><div class="route-meta"></div><div class="pills"></div><div class="canvas-wrap"><canvas width="340" height="340"></canvas></div><div class="checks"></div><div class="row"><button class="btn secondary choose" style="margin:0">ナビに選択</button><button class="btn secondary del" style="margin:0">削除</button></div>';d.querySelector('.route-title').textContent=r.name;d.querySelector('.route-meta').textContent=new Date(r.createdAt).toLocaleString('ja-JP');d.querySelector('.pills').innerHTML=`<span class="pill">${r.totalSteps}歩</span><span class="pill">${ftime(r.durationMs)}</span><span class="pill">${r.turns?.length||0} turns</span><span class="pill">${r.checkpoints?.length||0} photos</span>`;draw(d.querySelector('canvas'),r);const cc=d.querySelector('.checks');for(const cp of r.checkpoints||[]){const b=document.createElement('div');b.className='check';const img=document.createElement('img'),url=URL.createObjectURL(cp.blob);img.src=url;img.onload=()=>URL.revokeObjectURL(url);const lab=document.createElement('div');lab.textContent=`${cp.steps}歩`;b.append(img,lab);cc.appendChild(b)}d.querySelector('.choose').onclick=()=>{$('navSelect').value=r.id;loadNav(r.id);show('nav')};d.querySelector('.del').onclick=async()=>{if(confirm(`「${r.name}」を削除しますか？`)){await delRoute(r.id);refresh()}};list.appendChild(d)}const sel=$('navSelect'),prev=sel.value;sel.innerHTML='<option value="">ルートを選択</option>';for(const r of rs){const o=document.createElement('option');o.value=r.id;o.textContent=`${r.name} / ${r.totalSteps}歩`;sel.appendChild(o)}if(rs.some(r=>r.id===prev))sel.value=prev}
-async function loadNav(id){const rs=await getRoutes();st.route=rs.find(r=>r.id===id)||null;st.nav=false;st.nraw=0;st.noffset=0;st.candidate=null;$('offset').textContent='なし';$('matchResult').hidden=true;renderNav()}
-function nearest(r,steps){let best=null,err=1e9;for(const e of r?.events||[]){const x=Math.abs(e.steps-steps);if(x<err){err=x;best=e}}return best}function nextT(r,steps){return(r?.turns||[]).find(t=>t.steps>steps+1)||null}
-function renderNav(){const r=st.route,steps=Math.max(0,st.nraw+st.noffset);$('navSteps').textContent=steps;$('navHead').textContent=st.heading==null?'--°':`${st.heading.toFixed(0)}°`;if(!r){$('navProgress').textContent='0%';$('progressBar').style.width='0%';$('nextTurn').textContent='ルートを選択してください';draw($('navCanvas'),null);return}const p=clamp(steps/Math.max(1,r.totalSteps),0,1);$('navProgress').textContent=`${Math.round(p*100)}%`;$('progressBar').style.width=`${p*100}%`;const e=nearest(r,steps);$('recHead').textContent=e?.heading==null?'--°':`${e.heading.toFixed(0)}°`;$('headDiff').textContent=e?.heading==null||st.heading==null?'--°':`${adiff(e.heading,st.heading).toFixed(0)}°`;const t=nextT(r,steps);$('nextTurn').textContent=p>=.98?'GOAL付近です':t?`次の大きな方向変化まで約 ${Math.max(0,t.steps-steps)} 歩`:'この先に大きな方向変化はありません';draw($('navCanvas'),r,p)}
-function startNav(){if(!st.granted){alert('先に登録タブでセンサーを許可してください。');return}if(!st.route){alert('ルートを選択してください。');return}st.nav=true;st.nraw=0;st.noffset=0;$('offset').textContent='なし';navButtons(true)}function stopNav(){st.nav=false;navButtons(false)}function navButtons(active){$('navButtons').innerHTML=active?'<button id="stopNav" class="btn danger">ナビ停止</button><button id="visualMatch" class="btn secondary">画像で現在地点を補正</button>':'<button id="startNav" class="btn">同じSTART地点からナビ開始</button><button id="visualMatch" class="btn secondary">画像で現在地点を補正</button>';if(active)$('stopNav').onclick=stopNav;else $('startNav').onclick=startNav;$('visualMatch').onclick=()=>openCamera('visual-match')}
-function show(name){document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===name));$('view-'+name).classList.add('active');if(name==='routes')refresh();if(name==='nav')renderNav();scrollTo(0,0)}
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>show(b.dataset.view));$('permit').onclick=permit;$('startRecord').onclick=startRecord;$('threshold').oninput=()=>{st.det.th=parseFloat($('threshold').value);$('thLabel').textContent=st.det.th.toFixed(2)};$('capture').onclick=capture;$('closeCamera').onclick=closeCamera;$('startNav').onclick=startNav;$('visualMatch').onclick=()=>openCamera('visual-match');$('applyMatch').onclick=applyMatch;$('navSelect').onchange=()=>loadNav($('navSelect').value);if(!window.isSecureContext)$('secureWarning').hidden=false;setInterval(()=>{if(st.recording)live()},500);db().then(refresh);
-})();
-</script>
-</body></html>
+<div id="cameraModal" class="modal">
+  <div class="video-wrap"><video id="video" playsinline autoplay muted></video></div>
+  <div class="camera-controls">
+    <div id="cameraHelp" class="note camera-help"></div>
+    <button id="btnCapture" class="btn">撮影</button>
+    <button id="btnCloseCamera" class="btn secondary">キャンセル</button>
+  </div>
+</div>
+
+<script src="./app.js?v=2.0.0"></script>
+</body>
+</html>

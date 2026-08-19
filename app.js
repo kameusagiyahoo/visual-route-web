@@ -1,0 +1,1130 @@
+(() => {
+'use strict';
+
+const APP_VERSION = '2.0.0';
+const DB_NAME = 'visual-route-web-v1';
+const DB_VERSION = 2;
+const DEFAULT_THRESHOLD = 1.10;
+const STRIDE_M = 0.70;
+const TURN_THRESHOLD_DEG = 42;
+const TURN_MIN_STEP_GAP = 2;
+const NAV_LOCAL_WINDOW_STEPS = 10;
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const normDeg = (d) => ((d % 360) + 360) % 360;
+const signedAngle = (from, to) => ((to - from + 540) % 360) - 180;
+const angleDiff = (a, b) => Math.abs(signedAngle(a, b));
+const fmtTime = (ms) => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function smoothAngle(previous, next, alpha = 0.22) {
+  if (previous == null) return normDeg(next);
+  return normDeg(previous + signedAngle(previous, next) * alpha);
+}
+
+function relHeading(startHeading, currentHeading) {
+  if (startHeading == null || currentHeading == null) return null;
+  return signedAngle(startHeading, currentHeading);
+}
+
+const state = {
+  sensorGranted: false,
+  motionActive: false,
+  orientationActive: false,
+  heading: null,
+  headingSource: 'unknown',
+  compassAccuracy: null,
+  orientation: { alpha: null, beta: null, gamma: null },
+  dynamicAcc: 0,
+  detector: {
+    gravity: 9.81,
+    smooth: 0,
+    p2: 0,
+    p1: 0,
+    lastStepAt: 0,
+    threshold: Number(localStorage.getItem('visualRoute.stepThreshold')) || DEFAULT_THRESHOLD,
+    refractoryMs: 280,
+  },
+  calibrating: false,
+  calibrationSamples: [],
+  measurementPaused: false,
+  wakeLock: null,
+
+  recording: false,
+  recordStartAt: 0,
+  recordStartHeading: null,
+  recordSteps: 0,
+  recordEvents: [],
+  recordCheckpoints: [],
+
+  navActive: false,
+  navRoute: null,
+  navStartHeading: null,
+  navRawSteps: 0,
+  navOffset: 0,
+  navEvents: [],
+  navEstimateStep: 0,
+  navTurnAnchorHeading: 0,
+  navTurnAnchorStep: 0,
+  navMatchedTurnIndex: 0,
+  lastTurnCorrection: null,
+  lastVisualCorrection: null,
+  navCandidate: null,
+
+  stream: null,
+  cameraMode: null,
+};
+
+let dbPromise = null;
+
+function openDB() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('routes')) {
+        db.createObjectStore('routes', { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return dbPromise;
+}
+
+async function putRoute(route) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('routes', 'readwrite');
+    tx.objectStore('routes').put(route);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getRoutes() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('routes', 'readonly');
+    const req = tx.objectStore('routes').getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function deleteRoute(id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('routes', 'readwrite');
+    tx.objectStore('routes').delete(id);
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+function normalizeRoute(route) {
+  const r = { ...route };
+  r.schemaVersion = r.schemaVersion || 1;
+  r.strideM = r.strideM || STRIDE_M;
+  r.events = Array.isArray(r.events) ? r.events.map((e) => ({ ...e })) : [];
+  const firstHeading = r.startHeading ?? r.events.find((e) => typeof e.heading === 'number')?.heading ?? 0;
+  for (const e of r.events) {
+    if (typeof e.relHeading !== 'number') {
+      e.relHeading = typeof e.heading === 'number' ? signedAngle(firstHeading, e.heading) : 0;
+    }
+  }
+  r.turns = detectTurns(r.events);
+  r.checkpoints = Array.isArray(r.checkpoints) ? r.checkpoints.map((cp) => {
+    const next = { ...cp };
+    if (typeof next.relHeading !== 'number') {
+      next.relHeading = typeof next.heading === 'number' ? signedAngle(firstHeading, next.heading) : null;
+    }
+    return next;
+  }) : [];
+  return r;
+}
+
+function setDot(id, status) {
+  const el = $(id);
+  el.classList.toggle('ok', status === 'ok');
+  el.classList.toggle('bad', status === 'bad');
+}
+
+function renderCompassQuality() {
+  let text = '方角品質: '; let status = 'ok';
+  if (!state.orientationActive || state.heading == null) {
+    text += '未判定'; status = 'bad';
+  } else if (state.headingSource === 'webkitCompassHeading') {
+    if (typeof state.compassAccuracy === 'number' && state.compassAccuracy >= 0) {
+      if (state.compassAccuracy <= 20) text += `良好 (±${state.compassAccuracy.toFixed(0)}°)`;
+      else if (state.compassAccuracy <= 40) { text += `注意 (±${state.compassAccuracy.toFixed(0)}°)`; status = 'bad'; }
+      else { text += `低い (±${state.compassAccuracy.toFixed(0)}°)`; status = 'bad'; }
+    } else text += '利用可';
+  } else {
+    text += '相対値のみ'; status = 'bad';
+  }
+  $('compassQuality').textContent = text;
+  setDot('compassQualityDot', status);
+}
+
+function onOrientation(event) {
+  let nextHeading = null;
+  if (typeof event.webkitCompassHeading === 'number' && !Number.isNaN(event.webkitCompassHeading)) {
+    nextHeading = normDeg(event.webkitCompassHeading);
+    state.headingSource = 'webkitCompassHeading';
+    state.compassAccuracy = typeof event.webkitCompassAccuracy === 'number' ? event.webkitCompassAccuracy : null;
+  } else if (typeof event.alpha === 'number' && !Number.isNaN(event.alpha)) {
+    nextHeading = normDeg(360 - event.alpha);
+    state.headingSource = 'alpha';
+    state.compassAccuracy = null;
+  }
+  if (nextHeading != null) state.heading = smoothAngle(state.heading, nextHeading);
+  state.orientation = { alpha: event.alpha, beta: event.beta, gamma: event.gamma };
+  state.orientationActive = true;
+  setDot('orientDot', 'ok');
+  $('orientStatus').textContent = `方角: 受信中 (${state.headingSource})`;
+  renderCompassQuality();
+  renderLive();
+  renderNav();
+}
+
+function calculateDynamicAcceleration(event) {
+  const a = event.acceleration;
+  if (a && [a.x, a.y, a.z].every((v) => typeof v === 'number')) {
+    return Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+  }
+  const ag = event.accelerationIncludingGravity;
+  if (!ag || ![ag.x, ag.y, ag.z].every((v) => typeof v === 'number')) return null;
+  const mag = Math.sqrt(ag.x * ag.x + ag.y * ag.y + ag.z * ag.z);
+  state.detector.gravity = 0.94 * state.detector.gravity + 0.06 * mag;
+  return Math.abs(mag - state.detector.gravity);
+}
+
+function resetDetectorTransient() {
+  state.detector.smooth = 0;
+  state.detector.p1 = 0;
+  state.detector.p2 = 0;
+  state.detector.lastStepAt = performance.now();
+}
+
+function detectPeak(now, value) {
+  const d = state.detector;
+  const p2 = d.p2;
+  const p1 = d.p1;
+  const isPeak = p1 > p2 && p1 >= value && p1 >= d.threshold;
+  if (isPeak && now - d.lastStepAt >= d.refractoryMs) {
+    d.lastStepAt = now;
+    countStep();
+  }
+  d.p2 = p1;
+  d.p1 = value;
+}
+
+function onMotion(event) {
+  const raw = calculateDynamicAcceleration(event);
+  if (raw == null) return;
+  state.detector.smooth = 0.68 * state.detector.smooth + 0.32 * raw;
+  state.dynamicAcc = state.detector.smooth;
+  state.motionActive = true;
+  setDot('motionDot', 'ok');
+  $('motionStatus').textContent = 'DeviceMotion: 受信中';
+
+  const now = performance.now();
+  if (state.calibrating && !state.measurementPaused) {
+    state.calibrationSamples.push({ t: now, v: state.detector.smooth });
+  }
+  if (!state.measurementPaused) detectPeak(now, state.detector.smooth);
+  renderLive();
+}
+
+function countStep() {
+  if (state.calibrating) return;
+  if (state.recording) {
+    state.recordSteps += 1;
+    state.recordEvents.push({
+      t: Date.now(),
+      steps: state.recordSteps,
+      heading: state.heading,
+      relHeading: relHeading(state.recordStartHeading, state.heading) ?? 0,
+      orientation: { ...state.orientation },
+    });
+  }
+  if (state.navActive) {
+    state.navRawSteps += 1;
+    const rel = relHeading(state.navStartHeading, state.heading) ?? 0;
+    const ev = { t: Date.now(), steps: state.navRawSteps, relHeading: rel, heading: state.heading };
+    state.navEvents.push(ev);
+    maybeCorrectFromTurn(ev);
+  }
+  renderLive();
+  renderNav();
+}
+
+function countPeaks(samples, threshold, refractoryMs = 280) {
+  let count = 0;
+  let last = -Infinity;
+  for (let i = 1; i < samples.length - 1; i += 1) {
+    const prev = samples[i - 1];
+    const cur = samples[i];
+    const next = samples[i + 1];
+    if (cur.v > prev.v && cur.v >= next.v && cur.v >= threshold && cur.t - last >= refractoryMs) {
+      count += 1;
+      last = cur.t;
+    }
+  }
+  return count;
+}
+
+function chooseThresholdForTarget(samples, target = 20) {
+  let best = { threshold: DEFAULT_THRESHOLD, count: countPeaks(samples, DEFAULT_THRESHOLD), error: Infinity };
+  for (let th = 0.35; th <= 2.80 + 1e-9; th += 0.05) {
+    const count = countPeaks(samples, th);
+    const error = Math.abs(count - target);
+    const tie = Math.abs(th - DEFAULT_THRESHOLD) * 0.02;
+    if (error + tie < best.error) best = { threshold: Number(th.toFixed(2)), count, error: error + tie };
+  }
+  return best;
+}
+
+async function toggleCalibration() {
+  if (!state.sensorGranted) {
+    alert('先に「センサーを許可」を押してください。');
+    return;
+  }
+  if (state.recording || state.navActive) {
+    alert('ルート記録/ナビ中はキャリブレーションできません。');
+    return;
+  }
+  if (!state.calibrating) {
+    state.calibrating = true;
+    state.calibrationSamples = [];
+    resetDetectorTransient();
+    $('btnCalibration').textContent = '20歩終わった → 調整する';
+    $('calibrationResult').textContent = '普段の持ち方で、正確に20歩歩いてからこのボタンをもう一度押してください。';
+    await requestWakeLock();
+    return;
+  }
+
+  state.calibrating = false;
+  releaseWakeLock();
+  if (state.calibrationSamples.length < 30) {
+    $('calibrationResult').textContent = 'データが少なすぎます。もう一度20歩歩いてください。';
+    $('btnCalibration').textContent = '20歩キャリブレーション';
+    return;
+  }
+  const result = chooseThresholdForTarget(state.calibrationSamples, 20);
+  state.detector.threshold = result.threshold;
+  localStorage.setItem('visualRoute.stepThreshold', String(result.threshold));
+  $('threshold').value = String(result.threshold);
+  $('thresholdLabel').textContent = result.threshold.toFixed(2);
+  $('calibrationResult').textContent = `自動調整: ${result.threshold.toFixed(2)} m/s²（このデータでは${result.count}歩検出）`;
+  $('btnCalibration').textContent = '20歩キャリブレーション';
+  resetDetectorTransient();
+}
+
+function resetCalibration() {
+  state.detector.threshold = DEFAULT_THRESHOLD;
+  localStorage.removeItem('visualRoute.stepThreshold');
+  $('threshold').value = String(DEFAULT_THRESHOLD);
+  $('thresholdLabel').textContent = DEFAULT_THRESHOLD.toFixed(2);
+  $('calibrationResult').textContent = '初期値へ戻しました。';
+}
+
+async function requestSensors() {
+  try {
+    let ok = true;
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      ok = ok && (await DeviceMotionEvent.requestPermission()) === 'granted';
+    }
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      ok = ok && (await DeviceOrientationEvent.requestPermission()) === 'granted';
+    }
+    if (!ok) throw new Error('センサー権限が拒否されました');
+    window.addEventListener('devicemotion', onMotion, { passive: true });
+    window.addEventListener('deviceorientation', onOrientation, { passive: true });
+    state.sensorGranted = true;
+    $('permissionBox').className = 'box goodbox';
+    $('permissionBox').textContent = 'センサー許可済み。iPhoneを少し動かして受信状態を確認してください。';
+    $('btnPermission').textContent = 'センサー許可済み';
+    $('btnPermission').disabled = true;
+  } catch (error) {
+    $('permissionBox').className = 'box error';
+    $('permissionBox').textContent = `センサーを開始できません: ${error?.message || error}`;
+  }
+}
+
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  try {
+    state.wakeLock = await navigator.wakeLock.request('screen');
+  } catch (_) {
+    state.wakeLock = null;
+  }
+}
+
+function releaseWakeLock() {
+  if (state.wakeLock) {
+    try { state.wakeLock.release(); } catch (_) {}
+    state.wakeLock = null;
+  }
+}
+
+function pauseMeasurement(reason) {
+  if (!(state.recording || state.navActive || state.calibrating)) return;
+  state.measurementPaused = true;
+  releaseWakeLock();
+  $('resumeReason').textContent = reason;
+  $('resumeBanner').hidden = false;
+}
+
+async function resumeMeasurement() {
+  state.measurementPaused = false;
+  resetDetectorTransient();
+  $('resumeBanner').hidden = true;
+  await requestWakeLock();
+}
+
+function renderLive() {
+  $('recordSteps').textContent = state.recordSteps;
+  $('dynamicAcc').textContent = state.dynamicAcc.toFixed(2);
+  $('absoluteHeading').textContent = state.heading == null ? '--°' : `${state.heading.toFixed(0)}°`;
+  const relative = state.recording ? relHeading(state.recordStartHeading, state.heading) : null;
+  $('relativeHeading').textContent = relative == null ? '--°' : `${relative.toFixed(0)}°`;
+  $('compassAccuracy').textContent = typeof state.compassAccuracy === 'number' && state.compassAccuracy >= 0 ? `±${state.compassAccuracy.toFixed(0)}°` : '--';
+  ['alpha', 'beta', 'gamma'].forEach((key) => {
+    const v = state.orientation[key];
+    $(key).textContent = typeof v === 'number' ? `${v.toFixed(1)}°` : '--°';
+  });
+  if (state.recording) $('elapsed').textContent = fmtTime(Date.now() - state.recordStartAt);
+}
+
+function ensureSensorReadyForRoute() {
+  if (!state.sensorGranted) {
+    alert('先に「センサーを許可」を押してください。');
+    return false;
+  }
+  if (!state.motionActive || state.heading == null) {
+    alert('まだセンサー値を受信できていません。iPhoneを少し動かして方角が表示されてから開始してください。');
+    return false;
+  }
+  return true;
+}
+
+async function startRecording() {
+  if (!ensureSensorReadyForRoute()) return;
+  if (state.calibrating) return;
+  state.recording = true;
+  state.recordSteps = 0;
+  state.recordStartAt = Date.now();
+  state.recordStartHeading = state.heading;
+  state.recordEvents = [{
+    t: Date.now(),
+    steps: 0,
+    heading: state.heading,
+    relHeading: 0,
+    orientation: { ...state.orientation },
+  }];
+  state.recordCheckpoints = [];
+  state.measurementPaused = false;
+  resetDetectorTransient();
+  $('recordButtons').innerHTML = `
+    <button id="btnStopRecord" class="btn danger">STOP 保存</button>
+    <button id="btnCheckpoint" class="btn secondary">現在地点を写真で記録</button>
+  `;
+  $('btnStopRecord').onclick = stopRecording;
+  $('btnCheckpoint').onclick = () => openCamera('checkpoint');
+  await requestWakeLock();
+  renderLive();
+}
+
+function detectTurns(events) {
+  if (!events?.length) return [];
+  const out = [];
+  let anchorHeading = events[0].relHeading ?? 0;
+  let anchorStep = events[0].steps ?? 0;
+  for (const ev of events) {
+    const current = ev.relHeading ?? 0;
+    const delta = signedAngle(anchorHeading, current);
+    if (Math.abs(delta) >= TURN_THRESHOLD_DEG && ev.steps - anchorStep >= TURN_MIN_STEP_GAP) {
+      out.push({ steps: ev.steps, relHeading: current, delta });
+      anchorHeading = current;
+      anchorStep = ev.steps;
+    }
+  }
+  return out;
+}
+
+async function stopRecording() {
+  state.recording = false;
+  releaseWakeLock();
+  if (state.recordSteps < 3) {
+    alert('歩数が少なすぎるため保存しません。');
+    resetRecordUI();
+    return;
+  }
+  const route = {
+    schemaVersion: 2,
+    appVersion: APP_VERSION,
+    id: `route-${Date.now()}`,
+    name: $('routeName').value.trim() || '無題ルート',
+    createdAt: new Date().toISOString(),
+    durationMs: Date.now() - state.recordStartAt,
+    totalSteps: state.recordSteps,
+    strideM: STRIDE_M,
+    startHeading: state.recordStartHeading,
+    stepThreshold: state.detector.threshold,
+    events: state.recordEvents,
+    turns: detectTurns(state.recordEvents),
+    checkpoints: state.recordCheckpoints,
+  };
+  await putRoute(route);
+  alert(`保存しました\n${route.name}\n${route.totalSteps}歩 / 曲がり${route.turns.length} / 写真${route.checkpoints.length}枚`);
+  resetRecordUI();
+  await refreshRoutes();
+}
+
+function resetRecordUI() {
+  state.recording = false;
+  state.recordSteps = 0;
+  state.recordEvents = [];
+  state.recordCheckpoints = [];
+  state.recordStartHeading = null;
+  state.measurementPaused = false;
+  $('resumeBanner').hidden = true;
+  $('elapsed').textContent = '0:00';
+  $('recordButtons').innerHTML = '<button id="btnStartRecord" class="btn">② START ルート記録</button>';
+  $('btnStartRecord').onclick = startRecording;
+  renderLive();
+}
+
+async function openCamera(mode) {
+  if (!window.isSecureContext) {
+    alert('カメラにはHTTPSが必要です。GitHub PagesからSafariで開いてください。');
+    return;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    alert('このSafariではカメラAPIを利用できません。');
+    return;
+  }
+  if (mode === 'checkpoint' && !state.recording) return;
+  if (mode === 'visual-match' && !state.navRoute) {
+    alert('先にナビ対象ルートを選択してください。');
+    return;
+  }
+  try {
+    state.cameraMode = mode;
+    state.stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    $('video').srcObject = state.stream;
+    $('cameraModal').classList.add('active');
+    $('cameraHelp').textContent = mode === 'checkpoint'
+      ? `記録中 ${state.recordSteps}歩地点。ドア枠・壁の角・固定棚など、後で同じ場所だと分かりやすい構図を撮影してください。`
+      : '登録時チェックポイントに近い向き・距離で撮影してください。似た場所が多い場合は特徴的な固定物を入れてください。';
+  } catch (error) {
+    alert(`カメラを開始できません: ${error?.message || error}`);
+  }
+}
+
+function closeCamera() {
+  $('cameraModal').classList.remove('active');
+  if (state.stream) {
+    state.stream.getTracks().forEach((track) => track.stop());
+    state.stream = null;
+  }
+  $('video').srcObject = null;
+}
+
+async function captureVideoFrame() {
+  const video = $('video');
+  if (video.videoWidth < 2 || video.videoHeight < 2) await sleep(250);
+  const maxWidth = 720;
+  const scale = Math.min(1, maxWidth / video.videoWidth);
+  const width = Math.max(1, Math.round(video.videoWidth * scale));
+  const height = Math.max(1, Math.round(video.videoHeight * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext('2d').drawImage(video, 0, 0, width, height);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.76));
+  const descriptor = computeDescriptorV2(canvas);
+  return { blob, descriptor };
+}
+
+function sampleDescriptor(canvas, cropRatio = 1) {
+  const w = 24; const h = 18;
+  const small = document.createElement('canvas');
+  small.width = w; small.height = h;
+  const ctx = small.getContext('2d', { willReadFrequently: true });
+  const sw = canvas.width * cropRatio;
+  const sh = canvas.height * cropRatio;
+  const sx = (canvas.width - sw) / 2;
+  const sy = (canvas.height - sh) / 2;
+  ctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, w, h);
+  const data = ctx.getImageData(0, 0, w, h).data;
+  const lum = new Array(w * h);
+  const histR = new Array(12).fill(0);
+  const histG = new Array(12).fill(0);
+  const histB = new Array(12).fill(0);
+  let brightness = 0;
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    lum[p] = y; brightness += y;
+    histR[Math.min(11, Math.floor(r / 256 * 12))] += 1;
+    histG[Math.min(11, Math.floor(g / 256 * 12))] += 1;
+    histB[Math.min(11, Math.floor(b / 256 * 12))] += 1;
+  }
+  brightness /= lum.length;
+  const mean = brightness;
+  const contrast = Math.sqrt(lum.reduce((sum, v) => sum + (v - mean) ** 2, 0) / lum.length);
+  const sd = contrast || 1;
+
+  const gridW = 12, gridH = 9;
+  const grid = [];
+  for (let gy = 0; gy < gridH; gy += 1) {
+    for (let gx = 0; gx < gridW; gx += 1) {
+      let sum = 0, n = 0;
+      const x0 = Math.floor(gx * w / gridW), x1 = Math.floor((gx + 1) * w / gridW);
+      const y0 = Math.floor(gy * h / gridH), y1 = Math.floor((gy + 1) * h / gridH);
+      for (let y = y0; y < y1; y += 1) for (let x = x0; x < x1; x += 1) { sum += lum[y * w + x]; n += 1; }
+      grid.push(((sum / Math.max(1, n)) - mean) / sd);
+    }
+  }
+
+  const edgeHist = new Array(8).fill(0);
+  let edgeEnergy = 0;
+  for (let y = 1; y < h - 1; y += 1) {
+    for (let x = 1; x < w - 1; x += 1) {
+      const gx = lum[y * w + (x + 1)] - lum[y * w + (x - 1)];
+      const gy = lum[(y + 1) * w + x] - lum[(y - 1) * w + x];
+      const mag = Math.sqrt(gx * gx + gy * gy);
+      if (mag < 10) continue;
+      edgeEnergy += mag;
+      let angle = Math.atan2(gy, gx);
+      if (angle < 0) angle += Math.PI * 2;
+      const bin = Math.min(7, Math.floor(angle / (Math.PI * 2) * 8));
+      edgeHist[bin] += mag;
+    }
+  }
+
+  const norm = (arr) => {
+    const sum = arr.reduce((a, b) => a + b, 0) || 1;
+    return arr.map((v) => v / sum);
+  };
+  const hashes = [];
+  for (let y = 0; y < h; y += 3) {
+    for (let x = 0; x < w - 1; x += 3) hashes.push(lum[y * w + x] > lum[y * w + x + 1] ? 1 : 0);
+  }
+  return {
+    grid,
+    hist: [...norm(histR), ...norm(histG), ...norm(histB)],
+    edge: norm(edgeHist),
+    hash: hashes,
+    quality: { brightness, contrast, edgeEnergy: edgeEnergy / Math.max(1, (w - 2) * (h - 2)) },
+  };
+}
+
+function computeDescriptorV2(canvas) {
+  const full = sampleDescriptor(canvas, 1.0);
+  const center = sampleDescriptor(canvas, 0.78);
+  return {
+    version: 2,
+    views: [full, center],
+    quality: full.quality,
+  };
+}
+
+function cosine(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, aa = 0, bb = 0;
+  for (let i = 0; i < a.length; i += 1) { dot += a[i] * b[i]; aa += a[i] * a[i]; bb += b[i] * b[i]; }
+  return dot / (Math.sqrt(aa * bb) || 1);
+}
+
+function hashSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let same = 0;
+  for (let i = 0; i < a.length; i += 1) if (a[i] === b[i]) same += 1;
+  return same / a.length;
+}
+
+function viewSimilarity(a, b) {
+  const grid = (cosine(a.grid, b.grid) + 1) / 2;
+  const hist = clamp(cosine(a.hist, b.hist), 0, 1);
+  const edge = clamp(cosine(a.edge, b.edge), 0, 1);
+  const hash = hashSimilarity(a.hash, b.hash);
+  return clamp(0.50 * grid + 0.20 * hist + 0.20 * edge + 0.10 * hash, 0, 1);
+}
+
+function descriptorSimilarity(a, b) {
+  if (!a?.views || !b?.views) return 0;
+  let best = 0;
+  for (const av of a.views) for (const bv of b.views) best = Math.max(best, viewSimilarity(av, bv));
+  return best;
+}
+
+function imageQualityMessage(descriptor) {
+  const q = descriptor?.quality;
+  if (!q) return { ok: true, text: '' };
+  const problems = [];
+  if (q.brightness < 40) problems.push('暗い');
+  if (q.brightness > 220) problems.push('明るすぎる');
+  if (q.contrast < 22) problems.push('コントラストが低い');
+  if (q.edgeEnergy < 14) problems.push('特徴が少ない/ぼけている');
+  return { ok: problems.length === 0, text: problems.join('・') };
+}
+
+async function blobToDescriptor(blob) {
+  let bitmap = null;
+  try {
+    if ('createImageBitmap' in window) bitmap = await createImageBitmap(blob);
+  } catch (_) {}
+  const canvas = document.createElement('canvas');
+  if (bitmap) {
+    canvas.width = bitmap.width; canvas.height = bitmap.height;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0);
+    bitmap.close?.();
+    return computeDescriptorV2(canvas);
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image(); el.onload = () => resolve(el); el.onerror = reject; el.src = url;
+    });
+    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+    canvas.getContext('2d').drawImage(img, 0, 0);
+    return computeDescriptorV2(canvas);
+  } finally { URL.revokeObjectURL(url); }
+}
+
+async function ensureCheckpointDescriptors(route) {
+  let changed = false;
+  for (const cp of route.checkpoints || []) {
+    if (cp.descriptor?.version === 2) continue;
+    if (cp.blob) {
+      try { cp.descriptor = await blobToDescriptor(cp.blob); changed = true; } catch (_) {}
+    }
+  }
+  if (changed) { route.schemaVersion = 2; await putRoute(route); }
+  return route;
+}
+
+async function captureCamera() {
+  try {
+    const snap = await captureVideoFrame();
+    if (state.cameraMode === 'checkpoint') {
+      if (!state.recording) { closeCamera(); return; }
+      const quality = imageQualityMessage(snap.descriptor);
+      if (!quality.ok && !confirm(`画像品質に注意: ${quality.text}\nそれでも保存しますか？`)) {
+        closeCamera(); return;
+      }
+      state.recordCheckpoints.push({
+        id: `cp-${Date.now()}`,
+        steps: state.recordSteps,
+        heading: state.heading,
+        relHeading: relHeading(state.recordStartHeading, state.heading),
+        blob: snap.blob,
+        descriptor: snap.descriptor,
+      });
+      closeCamera();
+      alert(`${state.recordSteps}歩地点の画像を保存しました。${quality.ok ? '' : `\n注意: ${quality.text}`}`);
+    } else {
+      closeCamera();
+      await performVisualMatch(snap.descriptor);
+    }
+  } catch (error) {
+    alert(`撮影処理に失敗しました: ${error?.message || error}`);
+  }
+}
+
+async function performVisualMatch(descriptor) {
+  if (!state.navRoute?.checkpoints?.length) {
+    alert('このルートにはチェックポイント画像がありません。');
+    return;
+  }
+  state.navRoute = await ensureCheckpointDescriptors(state.navRoute);
+  const currentRel = relHeading(state.navStartHeading, state.heading) ?? 0;
+  const candidates = [];
+  for (const cp of state.navRoute.checkpoints) {
+    if (!cp.descriptor?.views) continue;
+    const imageScore = descriptorSimilarity(descriptor, cp.descriptor);
+    const headingScore = typeof cp.relHeading === 'number' ? 1 - clamp(angleDiff(cp.relHeading, currentRel) / 100, 0, 1) : 0.5;
+    const score = 0.90 * imageScore + 0.10 * headingScore;
+    candidates.push({ cp, score, imageScore, headingScore });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  const second = candidates[1];
+  if (!best) {
+    alert('比較可能なチェックポイントがありません。');
+    return;
+  }
+  const margin = second ? best.score - second.score : 1;
+  const strong = best.score >= 0.72 && margin >= 0.035;
+  const acceptable = best.score >= 0.63 && margin >= 0.018;
+  state.navCandidate = acceptable ? best : null;
+
+  $('matchResult').hidden = false;
+  $('matchScore').textContent = `一致 ${(best.score * 100).toFixed(0)}% / 候補差 ${(margin * 100).toFixed(1)}pt`;
+  $('matchScore').className = `match ${strong ? 'good' : acceptable ? 'weak' : 'bad'}`;
+  let detail = `最有力: ${best.cp.steps}歩地点。画像単体 ${(best.imageScore * 100).toFixed(0)}%。`;
+  if (strong) detail += ' 第2候補との差もあり、補正候補として比較的信頼できます。';
+  else if (acceptable) detail += ' 補正は可能ですが、似た場所の誤一致に注意してください。';
+  else detail += ' 候補が曖昧です。固定物を大きく入れ、登録時に近い構図で再撮影してください。';
+  if (second) detail += ` 第2候補は${second.cp.steps}歩地点。`;
+  $('matchDetail').textContent = detail;
+  $('btnApplyMatch').hidden = !acceptable;
+}
+
+function applyVisualMatch() {
+  if (!state.navCandidate) return;
+  const cp = state.navCandidate.cp;
+  state.navOffset = cp.steps - state.navRawSteps;
+  state.navEstimateStep = cp.steps;
+  state.lastVisualCorrection = { at: Date.now(), steps: cp.steps, score: state.navCandidate.score };
+  $('visualCorrectionLabel').textContent = `${cp.steps}歩へ補正`;
+  $('matchDetail').textContent += ' 補正を適用しました。';
+  renderNav();
+}
+
+function maybeCorrectFromTurn(navEvent) {
+  const route = state.navRoute;
+  if (!route?.turns?.length) return;
+  const delta = signedAngle(state.navTurnAnchorHeading, navEvent.relHeading);
+  if (Math.abs(delta) < TURN_THRESHOLD_DEG || navEvent.steps - state.navTurnAnchorStep < TURN_MIN_STEP_GAP) return;
+
+  const navTurn = { steps: navEvent.steps, relHeading: navEvent.relHeading, delta };
+  state.navTurnAnchorHeading = navEvent.relHeading;
+  state.navTurnAnchorStep = navEvent.steps;
+
+  let matchIndex = -1;
+  for (let i = state.navMatchedTurnIndex; i < Math.min(route.turns.length, state.navMatchedTurnIndex + 2); i += 1) {
+    const rt = route.turns[i];
+    const sameDirection = Math.sign(rt.delta) === Math.sign(navTurn.delta);
+    const magnitudeOK = Math.abs(Math.abs(rt.delta) - Math.abs(navTurn.delta)) <= 65;
+    if (sameDirection && magnitudeOK) { matchIndex = i; break; }
+  }
+  if (matchIndex < 0) return;
+  const target = route.turns[matchIndex].steps;
+  const currentAdjusted = state.navRawSteps + state.navOffset;
+  const correction = target - currentAdjusted;
+  if (Math.abs(correction) <= 12) {
+    const applied = Math.round(correction * 0.75);
+    state.navOffset += applied;
+    state.lastTurnCorrection = { at: Date.now(), routeTurn: matchIndex + 1, applied, target };
+    state.navMatchedTurnIndex = matchIndex + 1;
+  }
+}
+
+function routePoints(route) {
+  const points = [{ x: 0, y: 0, steps: 0 }];
+  let x = 0, y = 0;
+  for (const ev of route?.events || []) {
+    if (!ev.steps) continue;
+    const h = (ev.relHeading ?? 0) * Math.PI / 180;
+    x += Math.sin(h) * (route.strideM || STRIDE_M);
+    y -= Math.cos(h) * (route.strideM || STRIDE_M);
+    points.push({ x, y, steps: ev.steps });
+  }
+  return points;
+}
+
+function clearCanvas(canvas) {
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#0b1118'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function drawRoute(canvas, route, progress = null) {
+  clearCanvas(canvas);
+  if (!route) return;
+  const ctx = canvas.getContext('2d');
+  const points = routePoints(route);
+  if (points.length < 2) return;
+  const xs = points.map((p) => p.x), ys = points.map((p) => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const rx = Math.max(0.5, maxX - minX), ry = Math.max(0.5, maxY - minY);
+  const pad = 28, usable = canvas.width - pad * 2, scale = Math.min(usable / rx, usable / ry);
+  const xy = (p) => ({
+    x: pad + (p.x - minX) * scale + (usable - rx * scale) / 2,
+    y: pad + (p.y - minY) * scale + (usable - ry * scale) / 2,
+  });
+  ctx.strokeStyle = '#596a82'; ctx.lineWidth = 3; ctx.beginPath();
+  points.forEach((p, i) => { const q = xy(p); if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y); });
+  ctx.stroke();
+  const dot = (p, color, r) => { const q = xy(p); ctx.fillStyle = color; ctx.beginPath(); ctx.arc(q.x, q.y, r, 0, Math.PI * 2); ctx.fill(); };
+  dot(points[0], '#62c77a', 7); dot(points[points.length - 1], '#efb85e', 7);
+  for (const turn of route.turns || []) {
+    const point = points.find((p) => p.steps >= turn.steps) || points[points.length - 1];
+    dot(point, '#c191ff', 4);
+  }
+  if (progress != null) {
+    const idx = clamp(Math.round(progress * (points.length - 1)), 0, points.length - 1);
+    dot(points[idx], '#4d91ff', 8);
+    const q = xy(points[idx]); ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q.x, q.y, 8, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.fillStyle = '#7b899c'; ctx.font = 'bold 12px -apple-system'; ctx.fillText('START↑', 10, 18);
+}
+
+function nearestRouteEvent(route, predictedStep, currentRelHeading) {
+  if (!route?.events?.length) return null;
+  let best = null, bestScore = Infinity;
+  const windowed = route.events.filter((ev) => Math.abs(ev.steps - predictedStep) <= NAV_LOCAL_WINDOW_STEPS);
+  const candidates = windowed.length ? windowed : route.events;
+  for (const ev of candidates) {
+    const stepError = Math.abs(ev.steps - predictedStep) / 4;
+    const headingError = currentRelHeading == null ? 0 : angleDiff(ev.relHeading ?? 0, currentRelHeading) / 45;
+    const score = stepError + 0.75 * headingError;
+    if (score < bestScore) { bestScore = score; best = ev; }
+  }
+  return best;
+}
+
+function nextRouteTurn(route, step) {
+  return (route?.turns || []).find((turn) => turn.steps > step + 1) || null;
+}
+
+function confidenceForNav(headingDifference) {
+  const visualFresh = state.lastVisualCorrection && Date.now() - state.lastVisualCorrection.at < 90000;
+  const turnFresh = state.lastTurnCorrection && Date.now() - state.lastTurnCorrection.at < 90000;
+  if (visualFresh && state.lastVisualCorrection.score >= 0.72) return { label: '高', cls: 'confidence-high' };
+  if ((turnFresh && headingDifference != null && headingDifference < 35) || (headingDifference != null && headingDifference < 20)) return { label: '高', cls: 'confidence-high' };
+  if (headingDifference == null || headingDifference < 50) return { label: '中', cls: 'confidence-medium' };
+  return { label: '低', cls: 'confidence-low' };
+}
+
+function renderNav() {
+  const route = state.navRoute;
+  const rawAdjusted = Math.max(0, state.navRawSteps + state.navOffset);
+  const currentRel = state.navActive ? relHeading(state.navStartHeading, state.heading) : null;
+  $('navRawSteps').textContent = String(state.navRawSteps);
+  $('navRelativeHeading').textContent = currentRel == null ? '--°' : `${currentRel.toFixed(0)}°`;
+  if (!route) {
+    $('navSteps').textContent = '0歩'; $('navProgressValue').textContent = '0%'; $('navProgressBar').style.width = '0%';
+    $('navRecordedHeading').textContent = '--°'; $('navHeadingDiff').textContent = '--°'; $('nextTurn').textContent = 'ルートを選択してください';
+    $('navConfidence').textContent = '--'; $('navConfidence').className = 'metric-value confidence-medium';
+    clearCanvas($('navCanvas')); return;
+  }
+
+  const nearest = nearestRouteEvent(route, rawAdjusted, currentRel);
+  let estimate = nearest ? nearest.steps : rawAdjusted;
+  if (state.navActive && state.navEstimateStep > 0 && estimate < state.navEstimateStep - 2) estimate = state.navEstimateStep - 2;
+  estimate = clamp(estimate, 0, route.totalSteps);
+  state.navEstimateStep = estimate;
+  const progress = clamp(estimate / Math.max(1, route.totalSteps), 0, 1);
+  const headingDiff = nearest && currentRel != null ? angleDiff(nearest.relHeading ?? 0, currentRel) : null;
+  const confidence = confidenceForNav(headingDiff);
+
+  $('navSteps').textContent = `${Math.round(estimate)}歩`;
+  $('navProgressValue').textContent = `${Math.round(progress * 100)}%`;
+  $('navProgressBar').style.width = `${progress * 100}%`;
+  $('navRecordedHeading').textContent = nearest ? `${(nearest.relHeading ?? 0).toFixed(0)}°` : '--°';
+  $('navHeadingDiff').textContent = headingDiff == null ? '--°' : `${headingDiff.toFixed(0)}°`;
+  $('navConfidence').textContent = confidence.label;
+  $('navConfidence').className = `metric-value ${confidence.cls}`;
+  $('turnCorrectionLabel').textContent = state.lastTurnCorrection ? `${state.lastTurnCorrection.applied >= 0 ? '+' : ''}${state.lastTurnCorrection.applied}歩` : 'なし';
+  $('visualCorrectionLabel').textContent = state.lastVisualCorrection ? `${state.lastVisualCorrection.steps}歩へ` : 'なし';
+
+  const turn = nextRouteTurn(route, estimate);
+  $('nextTurn').textContent = progress >= 0.98 ? 'GOAL付近です' : turn ? `次の大きな方向変化まで約 ${Math.max(0, Math.round(turn.steps - estimate))} 歩` : 'この先に大きな方向変化はありません';
+  drawRoute($('navCanvas'), route, progress);
+}
+
+async function loadNavRoute(id) {
+  const routes = (await getRoutes()).map(normalizeRoute);
+  state.navRoute = routes.find((r) => r.id === id) || null;
+  state.navActive = false;
+  state.navRawSteps = 0; state.navOffset = 0; state.navEstimateStep = 0; state.navEvents = [];
+  state.lastTurnCorrection = null; state.lastVisualCorrection = null; state.navCandidate = null;
+  state.navMatchedTurnIndex = 0;
+  $('matchResult').hidden = true;
+  renderNav();
+}
+
+async function startNavigation() {
+  if (!ensureSensorReadyForRoute()) return;
+  if (!state.navRoute) { alert('ルートを選択してください。'); return; }
+  state.navActive = true;
+  state.navRawSteps = 0; state.navOffset = 0; state.navEstimateStep = 0; state.navEvents = [];
+  state.navStartHeading = state.heading;
+  state.navTurnAnchorHeading = 0; state.navTurnAnchorStep = 0; state.navMatchedTurnIndex = 0;
+  state.lastTurnCorrection = null; state.lastVisualCorrection = null; state.navCandidate = null;
+  state.measurementPaused = false;
+  resetDetectorTransient();
+  renderNavButtons(true);
+  await requestWakeLock();
+  renderNav();
+}
+
+function stopNavigation() {
+  state.navActive = false;
+  releaseWakeLock();
+  state.measurementPaused = false;
+  $('resumeBanner').hidden = true;
+  renderNavButtons(false);
+}
+
+function renderNavButtons(active) {
+  $('navButtons').innerHTML = active
+    ? '<button id="btnStopNav" class="btn danger">ナビ停止</button><button id="btnVisualMatch" class="btn secondary">画像で現在地点を補正</button>'
+    : '<button id="btnStartNav" class="btn">同じSTART地点からナビ開始</button><button id="btnVisualMatch" class="btn secondary">画像で現在地点を補正</button>';
+  if (active) $('btnStopNav').onclick = stopNavigation; else $('btnStartNav').onclick = startNavigation;
+  $('btnVisualMatch').onclick = () => openCamera('visual-match');
+}
+
+async function refreshRoutes() {
+  const routes = (await getRoutes()).map(normalizeRoute).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const list = $('routesList'); list.innerHTML = '';
+  if (!routes.length) list.innerHTML = '<div class="card"><div class="note">まだ保存ルートがありません。「登録」から作成してください。</div></div>';
+
+  for (const route of routes) {
+    const el = document.createElement('div'); el.className = 'route';
+    el.innerHTML = `
+      <div class="route-title"></div><div class="route-meta"></div>
+      <div class="pills"></div>
+      <div class="canvas-wrap"><canvas width="340" height="340"></canvas></div>
+      <div class="checkpoints"></div>
+      <div class="row top-gap"><button class="btn secondary choose">ナビに選択</button><button class="btn secondary del">削除</button></div>`;
+    el.querySelector('.route-title').textContent = route.name;
+    el.querySelector('.route-meta').textContent = new Date(route.createdAt).toLocaleString('ja-JP');
+    el.querySelector('.pills').innerHTML = `<span class="pill">${route.totalSteps}歩</span><span class="pill">${fmtTime(route.durationMs)}</span><span class="pill">${route.turns.length} turns</span><span class="pill">${route.checkpoints.length} photos</span><span class="pill">schema v${route.schemaVersion}</span>`;
+    drawRoute(el.querySelector('canvas'), route);
+    const cps = el.querySelector('.checkpoints');
+    for (const cp of route.checkpoints) {
+      const box = document.createElement('div'); box.className = 'checkpoint';
+      const img = document.createElement('img');
+      if (cp.blob instanceof Blob) {
+        const url = URL.createObjectURL(cp.blob); img.src = url; img.onload = () => URL.revokeObjectURL(url);
+      }
+      const label = document.createElement('div'); label.textContent = `${cp.steps}歩`;
+      box.append(img, label); cps.appendChild(box);
+    }
+    el.querySelector('.choose').onclick = () => { $('navRouteSelect').value = route.id; loadNavRoute(route.id); switchView('nav'); };
+    el.querySelector('.del').onclick = async () => { if (confirm(`「${route.name}」を削除しますか？`)) { await deleteRoute(route.id); await refreshRoutes(); } };
+    list.appendChild(el);
+  }
+
+  const select = $('navRouteSelect'); const previous = select.value;
+  select.innerHTML = '<option value="">ルートを選択</option>';
+  for (const route of routes) {
+    const option = document.createElement('option'); option.value = route.id; option.textContent = `${route.name} / ${route.totalSteps}歩`;
+    select.appendChild(option);
+  }
+  if (routes.some((r) => r.id === previous)) select.value = previous;
+  await renderStorageInfo();
+}
+
+async function renderStorageInfo() {
+  if (!navigator.storage?.estimate) { $('storageInfo').textContent = 'ストレージ使用量: このSafariでは取得できません。'; return; }
+  try {
+    const { usage = 0, quota = 0 } = await navigator.storage.estimate();
+    const mb = (n) => (n / 1024 / 1024).toFixed(1);
+    $('storageInfo').textContent = `Safariサイトデータ概算: ${mb(usage)} MB / 上限 ${mb(quota)} MB`;
+  } catch (_) { $('storageInfo').textContent = 'ストレージ使用量を取得できませんでした。'; }
+}
+
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(blob);
+  });
+}
+
+async function dataURLToBlob(dataURL) {
+  const response = await fetch(dataURL); return response.blob();
+}
+
+async function exportBackup() {
+  const routes = (await getRoutes()).map(normalizeRoute);
+  const serialized = [];
+  for (const route of routes) {
+    const copy = { ...route, checkpoints: [] };
+    for (const cp of route.checkpoints) {
+      copy.checkpoints.push({ ...cp, blobDataURL: cp.blob instanceof Blob ? await blobToDataURL(cp.blob) : null, blob: undefined });
+    }
+    serialized.push(copy);
+  }
+  const payload = { format: 'visual-route-backup', version: 2, exportedAt: new Date().toISOString(), routes: serialized };
+  const file = new File([JSON.stringify(payload)], `visual-route-backup-${new Date().toISOString().slice(0, 10)}.json`, { type: 'application/json' });
+  if (navigator.share && navigator.canShare?.({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: 'Visual Route backup' }); return; } catch (error) { if (error?.name === 'AbortError') return; }
+  }
+  const url = URL.createObjectURL(file); const a = document.createElement('a'); a.href = url; a.download = file.name; a.click(); setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+
+async function importBackup(file) {
+  try {
+    const text = await file.text(); const payload = JSON.parse(text);
+    if (payload?.format !== 'visual-route-backup' || !Array.isArray(payload.routes)) throw new Error('Visual Routeバックアップ形式ではありません');
+    let count = 0;
+    for (const raw of payload.routes) {
+      const route = normalizeRoute(raw); route.checkpoints = [];
+      for (const cp of raw.checkpoints || []) {
+        route.checkpoints.push({ ...cp, blob: cp.blobDataURL ? await dataURLToBlob(cp.blobDataURL) : null, blobDataURL: undefined });
+      }
+      await putRoute(route); count += 1;
+    }
+    alert(`${count}ルートを復元しました。`); await refreshRoutes();
+  } catch (error) { alert(`復元に失敗しました: ${error?.message || error}`); }
+}
+
+function switchView(name) {
+  document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  $(`view-${name}`).classList.add('active');
+  if (name === 'routes') refreshRoutes();
+  if (name === 'nav') renderNav();
+  window.scrollTo({ top: 0, behavior: 'instant' });
+}
+
+function handleVisibility() {
+  if (document.visibilityState === 'hidden') {
+    pauseMeasurement('Safariが非表示になりました。バックグラウンド中のセンサー値は信用せず停止しています。');
+  } else if (!state.measurementPaused && (state.recording || state.navActive || state.calibrating)) {
+    requestWakeLock();
+  }
+}
+
+function bindUI() {
+  document.querySelectorAll('nav button').forEach((button) => { button.onclick = () => switchView(button.dataset.view); });
+  $('btnPermission').onclick = requestSensors;
+  $('btnCalibration').onclick = toggleCalibration;
+  $('btnResetCalibration').onclick = resetCalibration;
+  $('threshold').value = String(state.detector.threshold);
+  $('thresholdLabel').textContent = state.detector.threshold.toFixed(2);
+  $('threshold').oninput = () => {
+    state.detector.threshold = parseFloat($('threshold').value);
+    localStorage.setItem('visualRoute.stepThreshold', String(state.detector.threshold));
+    $('thresholdLabel').textContent = state.detector.threshold.toFixed(2);
+  };
+  $('btnStartRecord').onclick = startRecording;
+  $('btnCapture').onclick = captureCamera;
+  $('btnCloseCamera').onclick = closeCamera;
+  $('btnStartNav').onclick = startNavigation;
+  $('btnVisualMatch').onclick = () => openCamera('visual-match');
+  $('btnApplyMatch').onclick = applyVisualMatch;
+  $('navRouteSelect').onchange = () => loadNavRoute($('navRouteSelect').value);
+  $('btnResumeMeasurement').onclick = resumeMeasurement;
+  $('btnExport').onclick = exportBackup;
+  $('btnImport').onclick = () => $('importFile').click();
+  $('importFile').onchange = async () => { const file = $('importFile').files?.[0]; if (file) await importBackup(file); $('importFile').value = ''; };
+  document.addEventListener('visibilitychange', handleVisibility);
+  window.addEventListener('pagehide', () => pauseMeasurement('ページが非表示になりました。戻ったら「計測を再開」を押してください。'));
+}
+
+async function init() {
+  bindUI();
+  if (!window.isSecureContext) $('secureWarning').hidden = false;
+  if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('./sw.js?v=2.0.0').catch(() => {});
+  setInterval(() => { if (state.recording) renderLive(); }, 500);
+  try { await openDB(); await refreshRoutes(); } catch (error) { console.error(error); }
+  renderLive(); renderNav(); renderCompassQuality();
+}
+
+init();
+})();
