@@ -1,34 +1,20 @@
-# CHANGELOG — v4.0.0
+# CHANGELOG — v5.0.0
 
-## 対応した課題
+## 追加
+- Ground Truth記録
+- MAE / Median / P95
+- GOAL成功率
+- 画像補正のGT検証
+- LOCALIZED / UNCERTAIN / LOST FSM
+- LOST時の再ローカライズ高頻度化
+- 最大4フレームのSequence Place Recognition
+- 記録中の自動画像キーフレーム
+- Ground TruthからBayesian parameter自動調整
+- Graphの前後anchor/turn context検証
+- Runtime Diagnostics
+- 評価CSV出力
+- 評価データをIndexedDBに永続化
+- V5バックアップに評価/学習パラメータを追加
 
-1. 歩数誤差
-   - 固定threshold中心からAdaptive Step Detectorへ変更。
-   - rolling MAD、recent peak amplitude、cadence consistencyを利用。
-
-2. 曲がり角の磁気依存
-   - rotationRateとgravity vectorからworld-vertical yaw proxyを算出。
-   - turn detectionはgyro主体、compassはdrift補助。
-
-3. 分類モデルEmbedding
-   - MobileNetV2からDINOv2-small image-feature-extractionへ変更。
-   - Place model adapterとして独立させた。
-
-4. 手動画像補正
-   - ナビ中の自動再ローカライズを追加。
-   - interval/minimum steps/遠距離jump guardを実装。
-
-5. Graph誤結合
-   - Mutual nearest neighbor。
-   - best-second margin。
-   - route順序整合。
-   - same-route cluster conflict禁止。
-
-6. 技術スタックの可視化
-   - 専用「技術」タブを追加。
-   - Runtime / Browser APIs / algorithms / AI / privacy / live capabilityを表示。
-
-## 互換性
-
-V1〜V3のIndexedDBルートを読み込み可能です。
-旧checkpointにはDINOv2 embeddingがないため、モデル読込時に必要に応じて遅延生成します。
+## 継承
+V4のAdaptive Step Detector、Gyro主体turn、DINOv2、Bayesian Filter、自動画像再ローカライズ、Graph MNN/order consistencyを継承。

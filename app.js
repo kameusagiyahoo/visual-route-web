@@ -1,9 +1,9 @@
 (() => {
 'use strict';
 
-const APP_VERSION = '4.0.0';
+const APP_VERSION = '5.0.0';
 const DB_NAME = 'visual-route-web-v1';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const DEFAULT_THRESHOLD = 1.10;
 const STRIDE_M = 0.70;
 const TURN_THRESHOLD_DEG = 42;
@@ -88,6 +88,9 @@ function openDB() {
       const db = req.result;
       if (!db.objectStoreNames.contains('routes')) {
         db.createObjectStore('routes', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('evaluations')) {
+        db.createObjectStore('evaluations', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -2891,6 +2894,368 @@ function renderNavButtons(active) {
   // Manual mode opens the aiming view even when automatic relocalization is active.
   $('btnVisualMatch').onclick = () => openCamera('visual-match');
 }
+
+
+
+/* ===========================
+   V5 research / evaluation overlay
+   =========================== */
+const V5_DEFAULT_PARAMS = { stepAdvance: 1.10, headingSigma: 38, visualSigma: 1.8 };
+const V5_SEQUENCE_MAX = 4;
+const V5_LOST_HOLD_MS = 10000;
+const V5_RECENT_VISUAL_MS = 14000;
+const V5_GT_GOAL_TOL = 3;
+
+function loadV5Tuning() {
+  try {
+    const x = JSON.parse(localStorage.getItem('visualRoute.v5Tuning') || '{}');
+    return { global: { ...V5_DEFAULT_PARAMS, ...(x.global || {}) }, routes: x.routes || {}, samples: x.samples || 0 };
+  } catch (_) { return { global: { ...V5_DEFAULT_PARAMS }, routes: {}, samples: 0 }; }
+}
+function saveV5Tuning() { localStorage.setItem('visualRoute.v5Tuning', JSON.stringify(state.tuning)); }
+function activeV5Params(routeId = state.navRoute?.id) { return { ...state.tuning.global, ...(routeId && state.tuning.routes?.[routeId] ? state.tuning.routes[routeId] : {}) }; }
+
+state.tuning = loadV5Tuning();
+state.localization = { status: 'IDLE', changedAt: Date.now(), badSince: null, reason: 'ナビ開始待ち' };
+state.sequence = { history: [] };
+state.evalSession = null;
+state.diagnostics = { startedAt: Date.now(), motionTimes: [], aiInferenceMs: [], autoScans: 0, autoAccepted: 0, autoRejected: 0, sequenceFrames: 0, cameraErrors: 0, battery: null };
+state.recordVision = { stream: null, busy: false, lastStep: -999, count: 0 };
+state.graph.stats = { ...(state.graph.stats || {}), rejectedContext: 0 };
+
+async function putEvaluation(record) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('evaluations', 'readwrite'); tx.objectStore('evaluations').put(record);
+    tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+  });
+}
+async function getEvaluations() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('evaluations', 'readonly'); const req = tx.objectStore('evaluations').getAll();
+    req.onsuccess = () => resolve(req.result || []); req.onerror = () => reject(req.error);
+  });
+}
+async function deleteEvaluations() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => { const tx = db.transaction('evaluations','readwrite'); tx.objectStore('evaluations').clear(); tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); });
+}
+
+function percentile(values, q) {
+  if (!values.length) return null;
+  const a = [...values].sort((x,y)=>x-y); const pos=(a.length-1)*q; const lo=Math.floor(pos), hi=Math.ceil(pos);
+  return lo===hi ? a[lo] : a[lo] + (a[hi]-a[lo])*(pos-lo);
+}
+function mean(values) { return values.length ? values.reduce((a,b)=>a+b,0)/values.length : null; }
+
+function beliefPredictOneStep() {
+  const b = state.belief; if (!b) return;
+  const m = clamp(activeV5Params().stepAdvance, 0.65, 1.45);
+  let core;
+  if (m <= 1) core = [[0, 1-m], [1, m], [2, 0]];
+  else core = [[0,0], [1,2-m], [2,m-1]];
+  const noise = [[0,.08],[1,.76],[2,.14],[3,.02]];
+  const weights = new Map();
+  for (const [d,w] of core) weights.set(d,(weights.get(d)||0)+w*.82);
+  for (const [d,w] of noise) weights.set(d,(weights.get(d)||0)+w*.18);
+  const next = new Float64Array(b.length);
+  for (let i=0;i<b.length;i++) for (const [d,w] of weights) next[Math.min(b.length-1,i+d)] += b[i]*w;
+  state.belief = normalizeProbabilities(next);
+}
+
+function beliefObserveHeading(currentRelHeading) {
+  if (!state.belief || !state.navRoute || currentRelHeading == null) return;
+  const sigma = activeV5Params().headingSigma;
+  for (let i=0;i<state.belief.length;i++) {
+    const expected=routeHeadingAtStep(state.navRoute,i); const d=angleDiff(expected,currentRelHeading);
+    state.belief[i] *= 0.08 + 0.92*gaussian(d,sigma);
+  }
+  normalizeProbabilities(state.belief);
+}
+
+function sequenceAdjustedCandidates(baseCandidates) {
+  const history = state.sequence.history.slice(-V5_SEQUENCE_MAX + 1);
+  if (!history.length) return baseCandidates.map((c)=>({...c, sequenceSupport:null, singleScore:c.score, sequenceScore:c.score}));
+  const currentRaw = state.navRawSteps;
+  const adjusted = baseCandidates.map((c) => {
+    let weighted=0, wsum=0;
+    history.forEach((h,idx) => {
+      const ageWeight=(idx+1)/history.length; const expectedDelta=Math.max(0,currentRaw-h.rawStep);
+      let bestSupport=0;
+      for (const p of h.candidates) {
+        const routeDelta=c.cp.steps-p.cp.steps;
+        const dirPenalty=routeDelta < -2 ? 0.12 : 1;
+        const sigma=Math.max(3,expectedDelta*.6+2);
+        const continuity=gaussian(routeDelta-expectedDelta,sigma)*dirPenalty;
+        bestSupport=Math.max(bestSupport,p.score*continuity);
+      }
+      weighted += bestSupport*ageWeight; wsum += ageWeight;
+    });
+    const support=wsum?weighted/wsum:0;
+    const sequenceScore=0.68*c.score+0.32*support;
+    return {...c,singleScore:c.score,sequenceSupport:support,sequenceScore,score:sequenceScore};
+  });
+  return adjusted.sort((a,b)=>b.score-a.score);
+}
+function pushSequenceObservation(baseCandidates) {
+  state.sequence.history.push({ t:Date.now(), rawStep:state.navRawSteps, candidates:baseCandidates.slice(0,6).map((x)=>({cp:x.cp,score:x.score})) });
+  while(state.sequence.history.length>V5_SEQUENCE_MAX) state.sequence.history.shift();
+  state.diagnostics.sequenceFrames += 1;
+  if ($('sequenceStatus')) $('sequenceStatus').textContent=`画像系列: ${state.sequence.history.length} / ${V5_SEQUENCE_MAX} frames`;
+}
+
+async function performVisualMatch(descriptor, currentPlaceEmbedding = null, options = {}) {
+  if (!state.navRoute?.checkpoints?.length) { if(options.manual) alert('このルートにはチェックポイント画像がありません。'); return null; }
+  state.navRoute=await ensureCheckpointDescriptors(state.navRoute); if(state.ai.status==='ready') await ensureRoutePlaceEmbeddings(state.navRoute);
+  const base=visualCandidateScores(state.navRoute,descriptor,currentPlaceEmbedding);
+  const candidates=sequenceAdjustedCandidates(base); const best=candidates[0], second=candidates[1];
+  pushSequenceObservation(base);
+  if(!best) return null;
+  const margin=second?best.score-second.score:1; const aiUsed=best.neuralScore!=null;
+  const sequenceStrong=(best.sequenceSupport??0)>=0.68 && state.sequence.history.length>=2;
+  const strong=best.score>=(aiUsed?0.80:0.74) && margin>=(sequenceStrong?0.015:(aiUsed?0.025:0.035));
+  const acceptable=best.score>=(aiUsed?0.70:0.64) && margin>=0.012;
+  const result={...best,second,margin,strong,acceptable,aiUsed,sequenceStrong,sequenceLength:state.sequence.history.length};
+  if(options.manual){
+    state.navCandidate=acceptable?result:null; $('matchResult').hidden=false;
+    $('matchScore').textContent=`系列一致 ${(best.score*100).toFixed(0)}% / Δ${(margin*100).toFixed(1)}pt`;
+    $('matchScore').className=`match ${strong?'good':acceptable?'weak':'bad'}`;
+    let detail=`最有力: ${best.cp.steps}歩地点。単画像 ${(best.singleScore*100).toFixed(0)}%`;
+    if(best.sequenceSupport!=null) detail+=` + 系列support ${(best.sequenceSupport*100).toFixed(0)}%`;
+    detail+=aiUsed?` / DINOv2 ${(best.neuralScore*100).toFixed(0)}%。`:' / fallback画像特徴。';
+    detail+=strong?' 強い観測です。':acceptable?' 弱めの観測です。':' 曖昧です。';
+    if(second) detail+=` 第2候補: ${second.cp.steps}歩。`;
+    $('matchDetail').textContent=detail; $('btnApplyMatch').hidden=!acceptable;
+  }
+  return result;
+}
+
+function updateLocalizationState() {
+  if(!state.navActive || !state.navRoute){ state.localization.status='IDLE'; state.localization.reason='ナビ開始待ち'; renderLocalizationState(); return; }
+  const now=Date.now(); const stats=beliefStats(); const elapsed=now-(state.evalSession?.startedAt||now);
+  const recentVisual=state.lastVisualCorrection && now-state.lastVisualCorrection.at<V5_RECENT_VISUAL_MS;
+  const currentRel=currentRelativeHeading(); const headingErr=angleDiff(routeHeadingAtStep(state.navRoute,stats.map),currentRel);
+  const good=stats.confidence>=0.46 || (recentVisual && (state.lastVisualCorrection.score||0)>=0.78);
+  const bad=stats.confidence<0.22 && !recentVisual && headingErr>55;
+  let next=state.localization.status, reason='';
+  if(elapsed<3500){ next='LOCALIZING'; reason='初期位置分布を収束中'; state.localization.badSince=null; }
+  else if(good){ next='LOCALIZED'; reason=recentVisual?'画像観測 + 確率分布が整合':'確率分布が集中'; state.localization.badSince=null; }
+  else if(bad){
+    if(!state.localization.badSince) state.localization.badSince=now;
+    if(now-state.localization.badSince>=V5_LOST_HOLD_MS){ next='LOST'; reason='低信頼 + 方角不整合が継続'; }
+    else { next='UNCERTAIN'; reason='低信頼が継続中'; }
+  } else { next='UNCERTAIN'; reason=recentVisual?'画像観測はあるが分布が広い':'確率分布が広い'; state.localization.badSince=null; }
+  if(next!==state.localization.status){
+    state.localization.status=next; state.localization.changedAt=now;
+    if(next==='LOST' && state.evalSession){ state.evalSession.lostTransitions=(state.evalSession.lostTransitions||0)+1; state.evalSession.events.push({t:now,type:'LOST'}); }
+    if(next==='LOCALIZED' && state.evalSession) state.evalSession.events.push({t:now,type:'LOCALIZED'});
+  }
+  state.localization.reason=reason; renderLocalizationState();
+}
+function renderLocalizationState(){
+  if(!$('localizationState')) return; const s=state.localization.status;
+  $('localizationState').textContent=s; $('localizationState').className=`loc-state ${s.toLowerCase()}`;
+  $('localizationReason').textContent=state.localization.reason||'--';
+  $('localizationTimer').textContent=state.navActive?`状態継続 ${fmtTime(Date.now()-state.localization.changedAt)}`:'--';
+}
+
+function confidenceForNav(){
+  const stats=beliefStats(); if(!state.belief) return {label:'低',cls:'confidence-low'};
+  if(state.localization.status==='LOST') return {label:'LOST',cls:'confidence-low'};
+  if(stats.confidence>=0.64) return {label:'高',cls:'confidence-high'};
+  if(stats.confidence>=0.36) return {label:'中',cls:'confidence-medium'};
+  return {label:'低',cls:'confidence-low'};
+}
+
+function populateGroundTruthAnchors(){
+  const select=$('gtAnchorSelect'); if(!select) return; select.innerHTML='<option value="">地点を選択</option>';
+  const r=state.navRoute; if(!r) return;
+  const anchors=[{step:0,label:'START'}];
+  (r.turns||[]).forEach((t,i)=>anchors.push({step:t.steps,label:`Turn ${i+1} (${t.steps}歩)`}));
+  (r.checkpoints||[]).forEach((cp,i)=>anchors.push({step:cp.steps,label:`Photo ${i+1} (${cp.steps}歩)`}));
+  anchors.push({step:r.totalSteps,label:`GOAL (${r.totalSteps}歩)`});
+  const seen=new Set(); anchors.sort((a,b)=>a.step-b.step).forEach(a=>{const k=Math.round(a.step);if(seen.has(k))return;seen.add(k);const o=document.createElement('option');o.value=String(k);o.textContent=a.label;select.appendChild(o);});
+}
+
+async function markGroundTruth(){
+  if(!state.navActive||!state.navRoute||!state.evalSession){alert('ナビ中に記録してください。');return;}
+  const fromInput=$('gtStepInput').value; const fromSelect=$('gtAnchorSelect').value; const truth=Number(fromInput!==''?fromInput:fromSelect);
+  if(!Number.isFinite(truth)){alert('Ground Truth地点を選ぶか、歩数地点を入力してください。');return;}
+  const stats=beliefStats(); const map=stats.map; const currentRel=currentRelativeHeading(); const headingError=angleDiff(routeHeadingAtStep(state.navRoute,truth),currentRel);
+  const recentVisual=state.lastVisualCorrection && Date.now()-state.lastVisualCorrection.at<16000 ? state.lastVisualCorrection : null;
+  const sample={t:Date.now(),truthStep:truth,mapStep:map,meanStep:stats.mean,rawStep:state.navRawSteps,confidence:stats.confidence,status:state.localization.status,absError:Math.abs(map-truth),headingError,recentVisual:recentVisual?{steps:recentVisual.steps,score:recentVisual.score,source:recentVisual.source,error:Math.abs(recentVisual.steps-truth)}:null};
+  state.evalSession.groundTruth.push(sample);
+  $('gtLastResult').textContent=`GT ${truth}歩 / 推定 ${map}歩 / 誤差 ${sample.absError.toFixed(1)}歩 / ${sample.status}`;
+  $('gtStepInput').value=''; await saveCurrentEvalSession(false); await renderEvaluation();
+}
+
+function newEvalSession(){
+  return {id:`eval-${Date.now()}-${Math.random().toString(36).slice(2,7)}`,routeId:state.navRoute.id,routeName:state.navRoute.name,startedAt:Date.now(),endedAt:null,groundTruth:[],lostTransitions:0,events:[],visual:{attempts:0,accepted:0,rejected:0},diagnosticsStart:{...state.diagnostics},params:{...activeV5Params(state.navRoute.id)}};
+}
+async function saveCurrentEvalSession(finalize=false){
+  if(!state.evalSession)return; if(finalize)state.evalSession.endedAt=Date.now();
+  state.evalSession.visual={attempts:state.diagnostics.autoScans,accepted:state.diagnostics.autoAccepted,rejected:state.diagnostics.autoRejected};
+  state.evalSession.runtime={aiInferenceMs:[...state.diagnostics.aiInferenceMs],motionHz:diagnosticMotionHz(),sequenceFrames:state.diagnostics.sequenceFrames};
+  await putEvaluation(state.evalSession);
+}
+
+function startNavigationV5Session(){ state.evalSession=newEvalSession(); state.localization={status:'LOCALIZING',changedAt:Date.now(),badSince:null,reason:'初期位置分布を収束中'}; state.sequence.history=[]; state.diagnostics.startedAt=Date.now(); state.diagnostics.autoScans=0;state.diagnostics.autoAccepted=0;state.diagnostics.autoRejected=0;state.diagnostics.sequenceFrames=0; populateGroundTruthAnchors(); }
+
+async function startNavigation(){
+  if(!ensureSensorReadyForRoute())return; if(!state.navRoute){alert('ルートを選択してください。');return;}
+  state.navActive=true;state.navRawSteps=0;state.navOffset=0;state.navEstimateStep=0;state.navEvents=[];state.navTurns=[];
+  state.navStartHeading=state.heading;state.navMatchedTurnIndex=0;state.lastTurnCorrection=null;state.lastVisualCorrection=null;state.navCandidate=null;state.measurementPaused=false;
+  resetDetectorTransient();resetAdaptiveWalkingState();resetGyroRouteFrame();initBelief(state.navRoute,0);startNavigationV5Session();
+  renderNavButtons(true);await requestWakeLock();renderNav();if($('autoRelocEnabled').checked&&state.navRoute.checkpoints?.length)await startAutoRelocCamera();
+}
+async function stopNavigation(){
+  if(state.evalSession)await saveCurrentEvalSession(true); state.navActive=false;releaseWakeLock();stopAutoRelocCamera();renderNavButtons(false);renderNav();$('autoRelocStatus').textContent='ナビ停止。';state.localization={status:'IDLE',changedAt:Date.now(),badSince:null,reason:'ナビ停止'};renderLocalizationState();await renderEvaluation();
+}
+
+function applyVisualMatch(){
+  if(!state.navCandidate)return;const r=state.navCandidate;const sigma=activeV5Params().visualSigma*(r.strong?.8:1.35);beliefObservePosition(r.cp.steps,sigma,r.strong?8:3);
+  state.lastVisualCorrection={at:Date.now(),steps:r.cp.steps,score:r.score,source:r.aiUsed?'DINOv2 sequence':'fallback sequence'};
+  $('visualCorrectionLabel').textContent=`${r.cp.steps}歩 image系列観測`;$('matchDetail').textContent+=' 確率分布へ反映しました。';updateLocalizationState();renderNav();
+}
+
+function scheduleAutoReloc(){
+  if(!state.navActive||!state.autoReloc.stream)return;const requested=Number($('autoRelocInterval').value)||8;const sec=state.localization.status==='LOST'?Math.min(3,requested):requested;state.autoReloc.timer=setTimeout(runAutoRelocalization,sec*1000);
+}
+async function runAutoRelocalization(force=false){
+  if(state.autoReloc.timer){clearTimeout(state.autoReloc.timer);state.autoReloc.timer=null;}
+  if(!state.navActive||!state.autoReloc.stream||state.measurementPaused||document.visibilityState!=='visible'){scheduleAutoReloc();return;}
+  if(state.autoReloc.busy){scheduleAutoReloc();return;}
+  const minSteps=state.localization.status==='LOST'?0:(Number($('autoRelocMinSteps').value)||4);
+  if(!force&&Math.abs(state.navRawSteps-state.autoReloc.lastScanSteps)<minSteps){scheduleAutoReloc();return;}
+  state.autoReloc.busy=true;state.diagnostics.autoScans+=1;
+  try{
+    $('autoRelocStatus').textContent=state.localization.status==='LOST'?'LOST: 再ローカライズ探索中…':'画像系列を照合中…';
+    const snap=await captureVideoFrameFrom($('autoVideo'),state.ai.status==='ready'?448:320);state.autoReloc.lastScanAt=Date.now();state.autoReloc.lastScanSteps=state.navRawSteps;
+    const result=await performVisualMatch(snap.descriptor,snap.placeEmbedding,{manual:false});if(!result){state.diagnostics.autoRejected+=1;$('autoRelocStatus').textContent='比較候補なし';return;}
+    const stats=beliefStats();const distance=Math.abs(result.cp.steps-stats.map);const farJump=distance>Math.max(10,state.navRoute.totalSteps*.22);const unique=result.margin>=(result.sequenceStrong?.018:(result.aiUsed?.035:.05));
+    const recovery=state.localization.status==='LOST'&&result.strong&&(result.sequenceStrong||result.score>=.88);
+    const autoAccept=result.strong&&unique&&(!farJump||recovery||(result.score>=V4_AUTO_VERY_STRONG&&result.margin>=.06));
+    $('autoRelocLast').textContent=`最終系列: ${result.cp.steps}歩 ${(result.score*100).toFixed(0)}% / Δ${(result.margin*100).toFixed(1)}pt / ${result.sequenceLength}f`;
+    if(autoAccept){const sigma=activeV5Params().visualSigma*(recovery?.7:1);beliefObservePosition(result.cp.steps,sigma,result.sequenceStrong?7.5:6);state.lastVisualCorrection={at:Date.now(),steps:result.cp.steps,score:result.score,source:result.aiUsed?'auto DINOv2 sequence':'auto fallback sequence'};state.autoReloc.lastAppliedAt=Date.now();state.diagnostics.autoAccepted+=1;$('autoRelocStatus').textContent=`自動補正: ${result.cp.steps}歩地点${recovery?' (LOST recovery)':''}`;updateLocalizationState();renderNav();}
+    else{state.diagnostics.autoRejected+=1;$('autoRelocStatus').textContent=farJump&&!recovery?'遠距離ジャンプ候補 → 保留':'系列一意性不足 → 保留';}
+  }catch(error){state.diagnostics.autoRejected+=1;state.diagnostics.cameraErrors+=1;$('autoRelocStatus').textContent=`自動照合失敗: ${error?.message||error}`;}finally{state.autoReloc.busy=false;scheduleAutoReloc();}
+}
+
+async function startRecordVisionCamera(){
+  if(!$('recordAutoKeyframes')?.checked||!navigator.mediaDevices?.getUserMedia)return;
+  stopRecordVisionCamera();try{const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:640},height:{ideal:360}},audio:false});state.recordVision.stream=stream;$('recordVisionVideo').srcObject=stream;state.recordVision.lastStep=-999;state.recordVision.count=0;$('recordVisionStatus').textContent='自動キーフレーム取得中';setTimeout(()=>{if(state.recording)captureRecordKeyframe(true)},900);}catch(e){$('recordVisionStatus').textContent=`カメラ開始失敗: ${e?.message||e}`;}}
+function stopRecordVisionCamera(){if(state.recordVision.stream){state.recordVision.stream.getTracks().forEach(t=>t.stop());state.recordVision.stream=null;}if($('recordVisionVideo'))$('recordVisionVideo').srcObject=null;state.recordVision.busy=false;}
+async function captureRecordKeyframe(force=false){
+  if(!state.recording||!state.recordVision.stream||state.recordVision.busy)return;const interval=Number($('recordKeyframeSteps').value)||5;if(!force&&state.recordSteps-state.recordVision.lastStep<interval)return;state.recordVision.busy=true;
+  try{const snap=await captureVideoFrameFrom($('recordVisionVideo'),state.ai.status==='ready'?448:320);const q=imageQualityMessage(snap.descriptor);if(!q.ok&&!force)return;state.recordCheckpoints.push({id:`auto-cp-${Date.now()}`,steps:state.recordSteps,heading:state.heading,relHeading:currentRelativeHeading(),blob:snap.blob,descriptor:snap.descriptor,placeEmbedding:snap.placeEmbedding?{model:V4_PLACE_MODEL,values:snap.placeEmbedding}:null,autoKeyframe:true});state.recordVision.lastStep=state.recordSteps;state.recordVision.count+=1;$('recordVisionCount').textContent=`自動キーフレーム: ${state.recordVision.count}`;}catch(e){$('recordVisionStatus').textContent=`自動撮影失敗: ${e?.message||e}`;}finally{state.recordVision.busy=false;}}
+
+async function startRecording(){
+  if(!ensureSensorReadyForRoute())return;if(state.calibrating)return;state.recording=true;state.recordSteps=0;state.recordStartAt=Date.now();state.recordStartHeading=state.heading;
+  state.recordEvents=[{t:Date.now(),steps:0,heading:state.heading,relHeading:0,gyroRelHeading:0,orientation:{...state.orientation}}];state.recordCheckpoints=[];state.recordTurns=[];state.measurementPaused=false;resetDetectorTransient();resetAdaptiveWalkingState();resetGyroRouteFrame();
+  $('recordButtons').innerHTML='<button id="btnStopRecord" class="btn danger">STOP 保存</button><button id="btnCheckpoint" class="btn secondary">現在地点を写真で記録</button>';$('btnStopRecord').onclick=stopRecording;$('btnCheckpoint').onclick=()=>openCamera('checkpoint');await requestWakeLock();renderLive();if($('recordAutoKeyframes').checked)await startRecordVisionCamera();
+}
+async function stopRecording(){
+  if(state.recording&&state.recordVision.stream&&state.recordSteps-state.recordVision.lastStep>=2)await captureRecordKeyframe(true);state.recording=false;releaseWakeLock();stopRecordVisionCamera();if(state.recordSteps<3){alert('歩数が少なすぎるため保存しません。');resetRecordUI();return;}
+  const turns=state.recordTurns.length?state.recordTurns:detectTurns(state.recordEvents);const route={schemaVersion:5,appVersion:APP_VERSION,id:`route-${Date.now()}`,name:$('routeName').value.trim()||'無題ルート',createdAt:new Date().toISOString(),durationMs:Date.now()-state.recordStartAt,totalSteps:state.recordSteps,strideM:STRIDE_M,startHeading:state.recordStartHeading,stepThreshold:state.detector.threshold,adaptiveStep:true,headingMode:state.gyro.available?'gyro-gravity-projection+compass-drift':'compass-fallback',autoKeyframes:state.recordVision.count,events:state.recordEvents,turns,checkpoints:state.recordCheckpoints};await putRoute(route);alert(`保存しました\n${route.name}\n${route.totalSteps}歩 / 曲がり${route.turns.length} / 画像${route.checkpoints.length}枚`);resetRecordUI();await refreshRoutes();
+}
+
+function countStep(){
+  if(state.calibrating)return;const h=currentRelativeHeading();if(state.recording){state.recordSteps+=1;state.recordEvents.push({t:Date.now(),steps:state.recordSteps,heading:state.heading,relHeading:h,gyroRelHeading:h,orientation:{...state.orientation},cadenceSpm:state.stepAdaptive.cadenceSpm,effectiveThreshold:state.stepAdaptive.effectiveThreshold});if($('recordAutoKeyframes')?.checked)captureRecordKeyframe(false);}
+  if(state.navActive){state.navRawSteps+=1;const ev={t:Date.now(),steps:state.navRawSteps,relHeading:h,gyroRelHeading:h,heading:state.heading};state.navEvents.push(ev);beliefPredictOneStep();beliefObserveHeading(h);}
+  renderLive();renderNav();
+}
+
+function diagnosticMotionHz(){const now=performance.now();const a=state.diagnostics.motionTimes.filter(t=>now-t<5000);return a.length>=2?(a.length-1)/((a[a.length-1]-a[0])/1000):0;}
+function onMotion(event){
+  const now=performance.now();state.diagnostics.motionTimes.push(now);while(state.diagnostics.motionTimes.length&&now-state.diagnostics.motionTimes[0]>7000)state.diagnostics.motionTimes.shift();
+  const raw=calculateDynamicAcceleration(event);if(raw==null)return;state.detector.smooth=.70*state.detector.smooth+.30*raw;state.dynamicAcc=state.detector.smooth;state.motionActive=true;setDot('motionDot','ok');$('motionStatus').textContent='DeviceMotion: 受信中';updateGyro(event,now);updateAdaptiveThreshold(now,state.detector.smooth);if(state.calibrating&&!state.measurementPaused)state.calibrationSamples.push({t:now,v:state.detector.smooth});if(!state.measurementPaused)detectPeak(now,state.detector.smooth);renderLive();
+}
+
+async function extractPlaceEmbedding(blob){
+  if(state.ai.status!=='ready'||!state.ai.model||!(blob instanceof Blob))return null;const t0=performance.now();const url=URL.createObjectURL(blob);try{const output=await state.ai.model(url);return flattenFeatureOutput(output);}finally{URL.revokeObjectURL(url);const ms=performance.now()-t0;state.diagnostics.aiInferenceMs.push(ms);if(state.diagnostics.aiInferenceMs.length>200)state.diagnostics.aiInferenceMs.shift();}}
+
+function renderNav(){
+  const route=state.navRoute;const currentRel=state.navActive?currentRelativeHeading():null;$('navRawSteps').textContent=String(state.navRawSteps);$('navRelativeHeading').textContent=currentRel==null?'--°':`${currentRel.toFixed(0)}°`;
+  if(!route){$('navSteps').textContent='0歩';$('navProgressValue').textContent='0%';$('navProgressBar').style.width='0%';$('navRecordedHeading').textContent='--°';$('navHeadingDiff').textContent='--°';$('nextTurn').textContent='ルートを選択してください';$('navConfidence').textContent='--';clearCanvas($('navCanvas'));drawBelief();renderBeliefCandidates();renderLocalizationState();return;}
+  if(!state.belief||state.beliefRouteId!==route.id)initBelief(route,0);const stats=beliefStats();const estimate=clamp(stats.map,0,route.totalSteps);state.navEstimateStep=estimate;const progress=clamp(estimate/Math.max(1,route.totalSteps),0,1);const expected=routeHeadingAtStep(route,estimate);const diff=currentRel==null?null:angleDiff(expected,currentRel);updateLocalizationState();const confidence=confidenceForNav();
+  $('navSteps').textContent=state.localization.status==='LOST'?'不明':`${Math.round(estimate)}歩`;$('navProgressValue').textContent=state.localization.status==='LOST'?'--':`${Math.round(progress*100)}%`;$('navProgressBar').style.width=state.localization.status==='LOST'?'0%':`${progress*100}%`;$('navRecordedHeading').textContent=`${expected.toFixed(0)}°`;$('navHeadingDiff').textContent=diff==null?'--°':`${diff.toFixed(0)}°`;$('navConfidence').textContent=confidence.label;$('navConfidence').className=`metric-value ${confidence.cls}`;
+  $('turnCorrectionLabel').textContent=state.lastTurnCorrection?`${state.lastTurnCorrection.target}歩 gyro観測`:'なし';$('visualCorrectionLabel').textContent=state.lastVisualCorrection?`${state.lastVisualCorrection.steps}歩 ${state.lastVisualCorrection.source}`:'なし';const turn=nextRouteTurn(route,estimate);$('nextTurn').textContent=state.localization.status==='LOST'?'現在地を見失いました。周囲をゆっくり映してください。':progress>=.98?'GOAL付近です':turn?`次の大きな方向変化まで約 ${Math.max(0,Math.round(turn.steps-estimate))} 歩`:'この先に大きな方向変化はありません';drawRoute($('navCanvas'),route,progress);drawBelief();renderBeliefCandidates();renderLive();renderDiagnostics();
+}
+
+function buildAnchorContext(anchors,routes){
+  const map=new Map();const routeMap=new Map(routes.map(r=>[r.id,r]));
+  for(const route of routes){const ra=anchors.filter(a=>a.routeId===route.id).sort((a,b)=>a.step-b.step);for(let i=0;i<ra.length;i++){const a=ra[i],prev=ra[i-1],next=ra[i+1];const h=routeHeadingAtStep(route,a.step),hp=prev?routeHeadingAtStep(route,prev.step):null,hn=next?routeHeadingAtStep(route,next.step):null;map.set(a.key,{prevGap:prev?a.step-prev.step:null,nextGap:next?next.step-a.step:null,turnIn:hp==null?null:signedAngle(hp,h),turnOut:hn==null?null:signedAngle(h,hn)});}}
+  return map;
+}
+function scalarContextSim(a,b,scale){if(a==null||b==null)return null;return Math.exp(-Math.abs(a-b)/scale);}
+function gapContextSim(a,b){if(a==null||b==null)return null;return Math.exp(-Math.abs(Math.log((a+1)/(b+1))));}
+function anchorContextSimilarity(ca,cb){
+  const score=(reverse=false)=>{const vals=[];const pg=reverse?cb.nextGap:cb.prevGap,ng=reverse?cb.prevGap:cb.nextGap;const ti=reverse&&cb.turnOut!=null?-cb.turnOut:cb.turnIn,to=reverse&&cb.turnIn!=null?-cb.turnIn:cb.turnOut;[[gapContextSim(ca.prevGap,pg),1],[gapContextSim(ca.nextGap,ng),1],[scalarContextSim(ca.turnIn,ti,55),.8],[scalarContextSim(ca.turnOut,to,55),.8]].forEach(([v,w])=>{if(v!=null)vals.push([v,w]);});if(!vals.length)return{value:.5,coverage:0};return{value:vals.reduce((s,[v,w])=>s+v*w,0)/vals.reduce((s,[v,w])=>s+w,0),coverage:vals.length/4};};const f=score(false),r=score(true);return f.value>=r.value?f:r;
+}
+
+async function buildRouteGraph(){
+  const routes=(await getRoutes()).map(normalizeRoute);const stats={accepted:0,rejectedMutual:0,rejectedMargin:0,rejectedOrder:0,rejectedConflict:0,rejectedContext:0};if(!routes.length){state.graph={nodes:[],edges:[],builtAt:Date.now(),stats};renderGraph();return;}$('graphStatus').textContent='構築中…';if(state.ai.status==='ready')for(const route of routes)await ensureRoutePlaceEmbeddings(route);
+  const anchors=[];for(const route of routes){const cps=[...(route.checkpoints||[])].sort((a,b)=>a.steps-b.steps),ra=[];const first=cps.find(cp=>cp.steps<=3)||null,last=[...cps].reverse().find(cp=>cp.steps>=route.totalSteps-3)||null;ra.push({routeId:route.id,routeName:route.name,step:0,kind:'start',cp:first,key:`${route.id}:start`});for(const cp of cps)if(cp!==first&&cp!==last)ra.push({routeId:route.id,routeName:route.name,step:cp.steps,kind:'checkpoint',cp,key:`${route.id}:${cp.id}`});ra.push({routeId:route.id,routeName:route.name,step:route.totalSteps,kind:'goal',cp:last,key:`${route.id}:goal`});anchors.push(...ra.sort((a,b)=>a.step-b.step));}
+  const contexts=buildAnchorContext(anchors,routes),acceptedPairs=[];
+  for(let ri=0;ri<routes.length;ri++)for(let rj=ri+1;rj<routes.length;rj++){
+    const A=anchors.filter(x=>x.routeId===routes[ri].id&&x.cp),B=anchors.filter(x=>x.routeId===routes[rj].id&&x.cp);if(!A.length||!B.length)continue;const matrix=[];for(let i=0;i<A.length;i++)for(let j=0;j<B.length;j++){const sim=checkpointPairSimilarity(A[i].cp,B[j].cp);matrix.push({i,j,a:A[i],b:B[j],score:sim.score,source:sim.source});}
+    const provisional=[];for(let i=0;i<A.length;i++){const ai=bestAndSecond(matrix.filter(m=>m.i===i));if(!ai.best)continue;const bj=bestAndSecond(matrix.filter(m=>m.j===ai.best.j));if(!bj.best||bj.best.i!==i){stats.rejectedMutual++;continue;}const threshold=ai.best.source==='dinov2'?V4_GRAPH_AI_THRESHOLD:V4_GRAPH_HAND_THRESHOLD;const marginA=ai.best.score-(ai.second?.score??0),marginB=bj.best.score-(bj.second?.score??0),high=ai.best.score>=threshold+.045;if(ai.best.score<threshold||(!(marginA>=.025&&marginB>=.025)&&!high)){stats.rejectedMargin++;continue;}const ctx=anchorContextSimilarity(contexts.get(ai.best.a.key),contexts.get(ai.best.b.key));if(ctx.coverage>=.5&&ctx.value<.34&&ai.best.score<threshold+.09){stats.rejectedContext++;continue;}provisional.push({...ai.best,contextScore:ctx.value,score:.84*ai.best.score+.16*ctx.value});}
+    const ordered=enforceOrderConsistency(provisional);stats.rejectedOrder+=ordered.rejected.length;acceptedPairs.push(...ordered.keep);
+  }
+  const uf=safeUnionFind(anchors),anchorIndex=new Map(anchors.map((a,i)=>[a.key,i]));for(const m of acceptedPairs.sort((a,b)=>b.score-a.score)){const ia=anchorIndex.get(m.a.key),ib=anchorIndex.get(m.b.key);if(!uf.join(ia,ib)){stats.rejectedConflict++;continue;}stats.accepted++;}
+  const groups=new Map();anchors.forEach((a,i)=>{const root=uf.find(i);if(!groups.has(root))groups.set(root,[]);groups.get(root).push({...a,anchorIndex:i});});const nodes=[],anchorToNode=new Map();let n=1;for(const members of groups.values()){const node={id:`N${n++}`,members,label:members.length>1?`共通地点 ${[...new Set(members.map(m=>m.routeName))].join(' / ')}`:`${members[0].routeName} ${members[0].kind==='start'?'START':members[0].kind==='goal'?'GOAL':`${members[0].step}歩`}`};nodes.push(node);members.forEach(m=>anchorToNode.set(m.key,node.id));}
+  const edges=[];for(const route of routes){const ra=anchors.filter(a=>a.routeId===route.id).sort((a,b)=>a.step-b.step);for(let i=0;i<ra.length-1;i++){const from=anchorToNode.get(ra[i].key),to=anchorToNode.get(ra[i+1].key);if(!from||!to||from===to)continue;edges.push({id:`${route.id}:${i}`,from,to,cost:Math.max(1,ra[i+1].step-ra[i].step),routeId:route.id,routeName:route.name,fromStep:ra[i].step,toStep:ra[i+1].step});}}
+  state.graph={nodes,edges,builtAt:Date.now(),ai:state.ai.status==='ready',stats};renderGraph();
+}
+function renderGraph(){
+  const graph=state.graph||{nodes:[],edges:[],stats:{}};$('graphNodeCount').textContent=String(graph.nodes.length||0);$('graphEdgeCount').textContent=String(graph.edges.length||0);$('graphStatus').textContent=graph.builtAt?`${new Date(graph.builtAt).toLocaleTimeString('ja-JP')} 構築。画像 + 前後文脈で統合。`:'未構築。';const s=graph.stats||{};$('graphAccepted').textContent=String(s.accepted||0);$('graphRejectedMutual').textContent=String(s.rejectedMutual||0);$('graphRejectedMargin').textContent=String(s.rejectedMargin||0);$('graphRejectedOrder').textContent=String(s.rejectedOrder||0);$('graphRejectedConflict').textContent=String(s.rejectedConflict||0);$('graphRejectedContext').textContent=String(s.rejectedContext||0);
+  const fill=select=>{const prev=select.value;select.innerHTML='<option value="">選択</option>';for(const node of graph.nodes){const o=document.createElement('option');o.value=node.id;o.textContent=`${node.id}: ${node.label}`;select.appendChild(o);}if(graph.nodes.some(x=>x.id===prev))select.value=prev;};fill($('graphFrom'));fill($('graphTo'));const list=$('graphNodesList');list.innerHTML='';for(const node of graph.nodes){const el=document.createElement('div');el.className='graph-node';const members=node.members.map(m=>`${m.routeName} @ ${m.step}歩${m.cp?' 📷':''}`).join('<br>');el.innerHTML=`<div class="graph-node-title">${node.id}: ${node.label}</div><div class="graph-node-meta">${node.members.length} anchor(s)</div><div class="graph-members">${members}</div>`;list.appendChild(el);}if(!graph.nodes.length)list.innerHTML='<div class="card"><div class="note">グラフはまだありません。</div></div>';
+}
+
+async function aggregateEvaluation(routeId=''){
+  let records=await getEvaluations();if(routeId)records=records.filter(r=>r.routeId===routeId);const samples=records.flatMap(r=>r.groundTruth||[]);const errors=samples.map(s=>s.absError).filter(Number.isFinite);const goalSamples=samples.filter(s=>{const rec=records.find(r=>r.groundTruth?.includes(s));const routeEnd=rec?null:null;return false;});
+  const routes=(await getRoutes()).map(normalizeRoute),rmap=new Map(routes.map(r=>[r.id,r]));let goalN=0,goalOK=0,visualN=0,visualOK=0,lostAtGt=0;
+  for(const rec of records)for(const s of rec.groundTruth||[]){const route=rmap.get(rec.routeId);if(route&&Math.abs(s.truthStep-route.totalSteps)<=1){goalN++;if(s.absError<=V5_GT_GOAL_TOL)goalOK++;}if(s.recentVisual){visualN++;if(s.recentVisual.error<=3)visualOK++;}if(s.status==='LOST')lostAtGt++;}
+  return{records,samples,errors,mae:mean(errors),median:percentile(errors,.5),p95:percentile(errors,.95),goalN,goalOK,visualN,visualOK,lostTransitions:records.reduce((s,r)=>s+(r.lostTransitions||0),0),lostAtGt};
+}
+async function populateEvalRoutes(){const routes=(await getRoutes()).map(normalizeRoute);const select=$('evalRouteSelect'),prev=select.value;select.innerHTML='<option value="">全ルート</option>';for(const r of routes){const o=document.createElement('option');o.value=r.id;o.textContent=r.name;select.appendChild(o);}if(routes.some(r=>r.id===prev))select.value=prev;}
+async function renderEvaluation(){if(!$('evalGtCount'))return;await populateEvalRoutes();const routeId=$('evalRouteSelect').value;const a=await aggregateEvaluation(routeId);$('evalGtCount').textContent=String(a.samples.length);$('evalMAE').textContent=a.mae==null?'--':a.mae.toFixed(2);$('evalMedian').textContent=a.median==null?'--':a.median.toFixed(2);$('evalP95').textContent=a.p95==null?'--':a.p95.toFixed(2);$('evalGoalRate').textContent=a.goalN?`${Math.round(a.goalOK/a.goalN*100)}%`:'--';$('evalVisualRate').textContent=a.visualN?`${Math.round(a.visualOK/a.visualN*100)}%`:'--';$('evalSessionCount').textContent=String(a.records.length);$('evalLostCount').textContent=String(a.lostTransitions);$('evalLostRate').textContent=a.samples.length?`${Math.round(a.lostAtGt/a.samples.length*100)}%`:'--';renderTuning();renderDiagnostics();
+  const list=$('evalRecordsList');list.innerHTML='';const rows=a.records.flatMap(r=>(r.groundTruth||[]).map(s=>({r,s}))).sort((x,y)=>y.s.t-x.s.t).slice(0,40);for(const {r,s} of rows){const el=document.createElement('div');el.className='eval-record';const cls=s.absError<=2?'eval-error-good':s.absError<=5?'eval-error-mid':'eval-error-bad';el.innerHTML=`<strong>${r.routeName} <span class="${cls}">誤差 ${s.absError.toFixed(1)}歩</span></strong><div class="small">GT ${s.truthStep} / MAP ${s.mapStep} / raw ${s.rawStep} / ${(s.confidence*100).toFixed(0)}% / ${s.status}</div>`;list.appendChild(el);}if(!rows.length)list.innerHTML='<div class="note">ナビ画面でGround Truthを記録してください。</div>';
+}
+
+async function trainV5Params(){
+  const routeId=$('evalRouteSelect').value;const a=await aggregateEvaluation(routeId);if(a.samples.length<5){$('tuneStatus').textContent='Ground Truthが5点以上必要です。';return;}
+  const ratios=a.samples.filter(s=>s.rawStep>=5&&s.truthStep>0).map(s=>s.truthStep/s.rawStep).filter(x=>x>=.6&&x<=1.5);const headingErrors=a.samples.map(s=>s.headingError).filter(Number.isFinite);const visualErrors=a.samples.filter(s=>s.recentVisual).map(s=>s.recentVisual.error).filter(Number.isFinite);
+  const params={...V5_DEFAULT_PARAMS};if(ratios.length)params.stepAdvance=clamp(percentile(ratios,.5),.72,1.38);if(headingErrors.length)params.headingSigma=clamp(Math.max(18,(percentile(headingErrors,.5)||20)*1.6),18,65);if(visualErrors.length)params.visualSigma=clamp((percentile(visualErrors,.5)||1)+1,1.1,4.5);
+  if(routeId)state.tuning.routes[routeId]=params;else state.tuning.global=params;state.tuning.samples=a.samples.length;saveV5Tuning();$('tuneStatus').textContent=`${routeId?'選択ルート':'全体'}の${a.samples.length} GT点から学習しました。`;renderTuning();
+}
+function resetV5Params(){const routeId=$('evalRouteSelect').value;if(routeId)delete state.tuning.routes[routeId];else state.tuning={global:{...V5_DEFAULT_PARAMS},routes:{},samples:0};saveV5Tuning();$('tuneStatus').textContent='既定値へ戻しました。';renderTuning();}
+function renderTuning(){if(!$('tuneStepAdvance'))return;const p=activeV5Params($('evalRouteSelect')?.value||state.navRoute?.id);$('tuneStepAdvance').textContent=p.stepAdvance.toFixed(3);$('tuneHeadingSigma').textContent=`${p.headingSigma.toFixed(1)}°`;$('tuneVisualSigma').textContent=`${p.visualSigma.toFixed(2)} steps`;$('tuneSamples').textContent=String(state.tuning.samples||0);}
+
+async function exportEvalCSV(){const routeId=$('evalRouteSelect').value;const a=await aggregateEvaluation(routeId);const lines=['session_id,route,datetime,truth_step,map_step,mean_step,raw_step,abs_error,confidence,status,heading_error,visual_step,visual_error'];for(const r of a.records)for(const s of r.groundTruth||[])lines.push([r.id,JSON.stringify(r.routeName),new Date(s.t).toISOString(),s.truthStep,s.mapStep,s.meanStep.toFixed(2),s.rawStep,s.absError.toFixed(2),s.confidence.toFixed(4),s.status,s.headingError.toFixed(2),s.recentVisual?.steps??'',s.recentVisual?.error??''].join(','));const file=new File([lines.join('\n')],`visual-route-eval-${new Date().toISOString().slice(0,10)}.csv`,{type:'text/csv'});if(navigator.share&&navigator.canShare?.({files:[file]})){try{await navigator.share({files:[file],title:'Visual Route evaluation'});return;}catch(e){if(e?.name==='AbortError')return;}}const url=URL.createObjectURL(file),ael=document.createElement('a');ael.href=url;ael.download=file.name;ael.click();setTimeout(()=>URL.revokeObjectURL(url),3000);}
+
+function renderDiagnostics(){if(!$('diagSession'))return;const d=state.diagnostics;$('diagSession').textContent=fmtTime(Date.now()-d.startedAt);$('diagMotionHz').textContent=`${diagnosticMotionHz().toFixed(1)} Hz`;const vals=d.aiInferenceMs;$('diagAiMedian').textContent=vals.length?`${percentile(vals,.5).toFixed(0)} ms`:'-- ms';$('diagAiP95').textContent=vals.length?`${percentile(vals,.95).toFixed(0)} ms`:'-- ms';$('diagAutoScans').textContent=String(d.autoScans);$('diagAutoAccepted').textContent=String(d.autoAccepted);$('diagSequenceFrames').textContent=String(d.sequenceFrames);$('diagBattery').textContent=d.battery==null?'API unavailable':`${Math.round(d.battery.level*100)}%${d.battery.charging?' charging':''}`;$('diagMemory').textContent=performance.memory?`${(performance.memory.usedJSHeapSize/1024/1024).toFixed(1)} MB`:'API unavailable';}
+async function initBatteryDiagnostic(){try{if(navigator.getBattery){const b=await navigator.getBattery();state.diagnostics.battery=b;}}catch(_){}}
+
+async function exportBackup(){
+  const routes=(await getRoutes()).map(normalizeRoute),serialized=[];for(const route of routes){const copy={...route,checkpoints:[]};for(const cp of route.checkpoints)copy.checkpoints.push({...cp,blobDataURL:cp.blob instanceof Blob?await blobToDataURL(cp.blob):null,blob:undefined});serialized.push(copy);}const evaluations=await getEvaluations();const payload={format:'visual-route-backup',version:5,exportedAt:new Date().toISOString(),routes:serialized,evaluations,tuning:state.tuning};const file=new File([JSON.stringify(payload)],`visual-route-backup-v5-${new Date().toISOString().slice(0,10)}.json`,{type:'application/json'});if(navigator.share&&navigator.canShare?.({files:[file]})){try{await navigator.share({files:[file],title:'Visual Route backup'});return;}catch(e){if(e?.name==='AbortError')return;}}const url=URL.createObjectURL(file),a=document.createElement('a');a.href=url;a.download=file.name;a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);
+}
+async function importBackup(file){try{const payload=JSON.parse(await file.text());if(payload?.format!=='visual-route-backup'||!Array.isArray(payload.routes))throw new Error('Visual Routeバックアップ形式ではありません');let count=0;for(const raw of payload.routes){const route=normalizeRoute(raw);route.checkpoints=[];for(const cp of raw.checkpoints||[])route.checkpoints.push({...cp,blob:cp.blobDataURL?await dataURLToBlob(cp.blobDataURL):null,blobDataURL:undefined});await putRoute(route);count++;}for(const e of payload.evaluations||[])await putEvaluation(e);if(payload.tuning){state.tuning=payload.tuning;saveV5Tuning();}alert(`${count}ルートと評価データを復元しました。`);await refreshRoutes();await renderEvaluation();}catch(e){alert(`復元に失敗しました: ${e?.message||e}`);}}
+
+async function loadNavRoute(id){const routes=(await getRoutes()).map(normalizeRoute);state.navRoute=routes.find(r=>r.id===id)||null;state.navActive=false;state.navRawSteps=0;state.navOffset=0;state.navEstimateStep=0;state.navEvents=[];state.lastTurnCorrection=null;state.lastVisualCorrection=null;state.navCandidate=null;state.navMatchedTurnIndex=0;state.sequence.history=[];initBelief(state.navRoute,0);$('matchResult').hidden=true;populateGroundTruthAnchors();renderNav();}
+
+function renderTechCapabilities(){
+  const set=(id,ok,yes,no='未対応')=>{if(!$(id))return;$(id).textContent=ok?yes:no;$(id).className=ok?'cap-ok':'cap-warn';};set('capSecure',window.isSecureContext,'HTTPS / secure');set('capMotion','DeviceMotionEvent'in window,'利用可能');set('capGyro',state.gyro.available,state.gyro.source,'未確認（センサー許可後に判定）');set('capCamera',!!navigator.mediaDevices?.getUserMedia,'利用可能');set('capIndexedDB','indexedDB'in window,'利用可能');set('capWakeLock','wakeLock'in navigator,'利用可能');set('capWebGPU',!!navigator.gpu,'利用可能');if($('capAIBackend'))$('capAIBackend').textContent=state.ai.status==='ready'?`${V4_PLACE_MODEL_LABEL} / ${state.ai.backend}`:state.ai.status==='error'?'AI fallback中':'未読み込み';renderDiagnostics();
+}
+
+function switchView(name){document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.view===name));$(`view-${name}`).classList.add('active');if(name==='routes')refreshRoutes();if(name==='nav')renderNav();if(name==='graph')renderGraph();if(name==='eval')renderEvaluation();if(name==='tech')renderTechCapabilities();window.scrollTo({top:0,behavior:'instant'});}
+
+function bindUI(){
+  document.querySelectorAll('nav button').forEach(button=>{button.onclick=()=>switchView(button.dataset.view);});$('btnPermission').onclick=requestSensors;$('btnCalibration').onclick=toggleCalibration;$('btnResetCalibration').onclick=resetCalibration;$('threshold').value=String(state.detector.threshold);$('thresholdLabel').textContent=state.detector.threshold.toFixed(2);$('threshold').oninput=()=>{state.detector.threshold=parseFloat($('threshold').value);localStorage.setItem('visualRoute.stepThreshold',String(state.detector.threshold));$('thresholdLabel').textContent=state.detector.threshold.toFixed(2);state.stepAdaptive.effectiveThreshold=state.detector.threshold;};$('btnStartRecord').onclick=startRecording;$('btnCapture').onclick=captureCamera;$('btnCloseCamera').onclick=closeCamera;$('btnStartNav').onclick=startNavigation;$('btnVisualMatch').onclick=manualVisualReloc;$('btnApplyMatch').onclick=applyVisualMatch;$('navRouteSelect').onchange=()=>loadNavRoute($('navRouteSelect').value);$('btnResumeMeasurement').onclick=resumeMeasurement;$('btnExport').onclick=exportBackup;$('btnImport').onclick=()=>$('importFile').click();$('importFile').onchange=async()=>{const file=$('importFile').files?.[0];if(file)await importBackup(file);$('importFile').value='';};$('btnLoadAI').onclick=()=>loadAIModel().catch(()=>{});$('btnLoadAIGraph').onclick=()=>loadAIModel().then(renderGraph).catch(()=>{});$('btnBuildGraph').onclick=()=>buildRouteGraph().catch(e=>{$('graphStatus').textContent=`構築エラー: ${e?.message||e}`;});$('btnGraphPath').onclick=calculateGraphPathUI;$('autoRelocEnabled').onchange=async()=>{if(!state.navActive)return;if($('autoRelocEnabled').checked)await startAutoRelocCamera();else{stopAutoRelocCamera();$('autoRelocStatus').textContent='自動補正OFF';}};$('btnMarkGT').onclick=markGroundTruth;$('gtAnchorSelect').onchange=()=>{if($('gtAnchorSelect').value)$('gtStepInput').value='';};$('btnRefreshEval').onclick=renderEvaluation;$('evalRouteSelect').onchange=renderEvaluation;$('btnExportEvalCSV').onclick=exportEvalCSV;$('btnTrainParams').onclick=trainV5Params;$('btnResetParams').onclick=resetV5Params;document.addEventListener('visibilitychange',handleVisibility);window.addEventListener('pagehide',()=>pauseMeasurement('ページが非表示になりました。戻ったら「計測を再開」を押してください。'));window.addEventListener('resize',()=>drawBelief());
+}
+
+async function init(){bindUI();if(!window.isSecureContext)$('secureWarning').hidden=false;if('serviceWorker'in navigator&&window.isSecureContext)navigator.serviceWorker.register('./sw.js?v=5.0.0').catch(()=>{});setInterval(()=>{if(state.recording)renderLive();renderLocalizationState();renderDiagnostics();},1000);try{await openDB();await refreshRoutes();}catch(e){console.error(e);}await initBatteryDiagnostic();renderAIStatus();renderLive();renderNav();renderCompassQuality();renderGraph();renderTechCapabilities();renderEvaluation();renderTuning();}
 
 init();
 })();

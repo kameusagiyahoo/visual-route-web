@@ -8,12 +8,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Visual Route">
 <link rel="manifest" href="./manifest.webmanifest">
-<link rel="stylesheet" href="./style.css?v=4.0.0">
-<title>Visual Route Lab v4</title>
+<link rel="stylesheet" href="./style.css?v=5.0.0">
+<title>Visual Route Lab v5</title>
 </head>
 <body>
 <header>
-  <div class="header-title">Visual Route Lab <span class="version">v4.0</span></div>
+  <div class="header-title">Visual Route Lab <span class="version">v5.0</span></div>
   <div class="header-sub">Mapless indoor route localization / Safari only</div>
 </header>
 
@@ -70,6 +70,19 @@
       <div class="note">DINOv2の汎用視覚特徴を場所照合用Embeddingとして利用します。WebGPUを先に試し、失敗時はWASMへフォールバックします。AIを読み込まなくても従来特徴で利用できます。</div>
     </div>
 
+    <div class="card">
+      <h2>画像系列キーフレーム</h2>
+      <label class="toggle-row"><input id="recordAutoKeyframes" type="checkbox" checked> 記録中に低頻度で自動撮影する</label>
+      <div class="row top-gap">
+        <div><label>間隔</label><select id="recordKeyframeSteps"><option value="3">3歩</option><option value="5" selected>5歩</option><option value="8">8歩</option></select></div>
+        <div><label>用途</label><div class="small">系列Place Recognition / Graph</div></div>
+      </div>
+      <div class="auto-camera-wrap top-gap">
+        <video id="recordVisionVideo" playsinline autoplay muted></video>
+        <div><div id="recordVisionStatus" class="small">START時にカメラを起動します。</div><div id="recordVisionCount" class="small">自動キーフレーム: 0</div></div>
+      </div>
+    </div>
+
     <div class="metrics">
       <div class="metric"><div class="metric-label">推定歩数</div><div id="recordSteps" class="metric-value">0</div><div class="metric-sub">START以降</div></div>
       <div class="metric"><div class="metric-label">相対方角</div><div id="relativeHeading" class="metric-value">--°</div><div class="metric-sub">START向き=0°</div></div>
@@ -114,7 +127,7 @@
 
   <section id="view-nav" class="view">
     <h1>簡易ナビ</h1>
-    <p class="lead">V3ではルート上の各地点に「現在いる確率」を持つベイズフィルタで、歩数・相対方角・曲がり角・画像を同時に統合します。</p>
+    <p class="lead">V5ではベイズ位置分布に加えて、LOCALIZED / UNCERTAIN / LOSTを明示判定し、画像系列・Ground Truth評価・自動学習を統合します。</p>
 
     <div class="card">
       <label>対象ルート</label>
@@ -126,6 +139,14 @@
       <div class="metric"><div class="metric-label">進捗</div><div id="navProgressValue" class="metric-value">0%</div><div class="metric-sub">route position</div></div>
       <div class="metric"><div class="metric-label">信頼度</div><div id="navConfidence" class="metric-value confidence-medium">--</div><div class="metric-sub">複数情報から評価</div></div>
       <div class="metric"><div class="metric-label">相対方角</div><div id="navRelativeHeading" class="metric-value">--°</div><div class="metric-sub">NAV開始向き=0°</div></div>
+    </div>
+
+    <div class="card loc-state-card">
+      <div class="loc-state-row">
+        <div><div class="metric-label">Localization State</div><div id="localizationState" class="loc-state localizing">LOCALIZING</div></div>
+        <div class="loc-state-right"><div id="localizationReason" class="small">ナビ開始待ち</div><div id="localizationTimer" class="small">--</div></div>
+      </div>
+      <div class="note top-gap">確率分布・方角整合・直近の画像観測から状態を判定します。LOST時は誤った位置を確定表示せず、画像再取得を優先します。</div>
     </div>
 
     <div class="card">
@@ -166,8 +187,21 @@
         <div>
           <div id="autoRelocStatus" class="small">ナビ開始時にカメラを起動します。</div>
           <div id="autoRelocLast" class="small">最終照合: --</div>
+          <div id="sequenceStatus" class="small">画像系列: 0 / 4 frames</div>
         </div>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Ground Truth（評価用）</h2>
+      <div class="note">実際に登録時のチェックポイント/曲がり角/GOALへ到達したときに記録します。ここで初めて「推定が何歩ずれたか」を定量化できます。</div>
+      <label class="top-gap">既知地点</label>
+      <select id="gtAnchorSelect"><option value="">地点を選択</option></select>
+      <div class="row top-gap">
+        <div><label>または登録ルート上の歩数地点</label><input id="gtStepInput" type="number" min="0" step="1" placeholder="例: 24"></div>
+        <div class="gt-action"><button id="btnMarkGT" class="btn good">今ここをGT記録</button></div>
+      </div>
+      <div id="gtLastResult" class="small">未記録</div>
     </div>
 
     <div class="card">
@@ -220,8 +254,9 @@
         <div>類似度/候補差NG</div><div id="graphRejectedMargin">0</div>
         <div>順序整合NG</div><div id="graphRejectedOrder">0</div>
         <div>同一route競合NG</div><div id="graphRejectedConflict">0</div>
+        <div>前後文脈NG</div><div id="graphRejectedContext">0</div>
       </div>
-      <div class="note top-gap">画像が似ているだけではNodeを統合しません。相互最近傍・第2候補との差・ルート順序整合・同一ルート重複禁止を通過した対応だけを採用します。</div>
+      <div class="note top-gap">画像が似ているだけではNodeを統合しません。相互最近傍・第2候補との差・順序に加え、前後anchorまでの歩数差と局所turn signatureを文脈として検証します。</div>
     </div>
 
     <div class="card">
@@ -235,6 +270,56 @@
     </div>
 
     <div id="graphNodesList"></div>
+  </section>
+
+  <section id="view-eval" class="view">
+    <h1>評価・学習</h1>
+    <p class="lead">V5は精度を「感覚」ではなく数値で比較します。Ground Truthから誤差統計を作り、ベイズフィルタのパラメータを自動調整できます。</p>
+
+    <div class="card">
+      <h2>評価対象</h2>
+      <label>ルート</label>
+      <select id="evalRouteSelect"><option value="">全ルート</option></select>
+      <div class="row top-gap"><button id="btnRefreshEval" class="btn secondary">集計を更新</button><button id="btnExportEvalCSV" class="btn secondary">CSV書き出し</button></div>
+    </div>
+
+    <div class="metrics eval-metrics">
+      <div class="metric"><div class="metric-label">GT samples</div><div id="evalGtCount" class="metric-value">0</div><div class="metric-sub">真値記録数</div></div>
+      <div class="metric"><div class="metric-label">MAE</div><div id="evalMAE" class="metric-value">--</div><div class="metric-sub">steps</div></div>
+      <div class="metric"><div class="metric-label">Median</div><div id="evalMedian" class="metric-value">--</div><div class="metric-sub">steps</div></div>
+      <div class="metric"><div class="metric-label">P95</div><div id="evalP95" class="metric-value">--</div><div class="metric-sub">steps</div></div>
+      <div class="metric"><div class="metric-label">GOAL成功</div><div id="evalGoalRate" class="metric-value">--</div><div class="metric-sub">±3 steps</div></div>
+      <div class="metric"><div class="metric-label">画像補正精度</div><div id="evalVisualRate" class="metric-value">--</div><div class="metric-sub">GTで検証済み</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Localization状態</h2>
+      <div class="kv"><div>評価sessions</div><div id="evalSessionCount">0</div><div>LOST遷移</div><div id="evalLostCount">0</div><div>GT時LOST率</div><div id="evalLostRate">--</div></div>
+    </div>
+
+    <div class="card">
+      <h2>ベイズパラメータ自動学習</h2>
+      <div class="kv"><div>Step advance</div><div id="tuneStepAdvance">--</div><div>Heading σ</div><div id="tuneHeadingSigma">--</div><div>Visual σ</div><div id="tuneVisualSigma">--</div><div>学習sample</div><div id="tuneSamples">0</div></div>
+      <div class="row top-gap"><button id="btnTrainParams" class="btn">GTから学習</button><button id="btnResetParams" class="btn secondary">既定値に戻す</button></div>
+      <div id="tuneStatus" class="note">Ground Truthが5点以上あると学習できます。</div>
+    </div>
+
+    <div class="card">
+      <h2>Runtime Diagnostics</h2>
+      <div class="kv">
+        <div>Session</div><div id="diagSession">--</div>
+        <div>Motion rate</div><div id="diagMotionHz">-- Hz</div>
+        <div>AI inference median</div><div id="diagAiMedian">-- ms</div>
+        <div>AI inference P95</div><div id="diagAiP95">-- ms</div>
+        <div>Auto scans</div><div id="diagAutoScans">0</div>
+        <div>Auto accepted</div><div id="diagAutoAccepted">0</div>
+        <div>Sequence frames</div><div id="diagSequenceFrames">0</div>
+        <div>Battery API</div><div id="diagBattery">--</div>
+        <div>JS heap</div><div id="diagMemory">--</div>
+      </div>
+    </div>
+
+    <div class="card"><h2>Ground Truth履歴</h2><div id="evalRecordsList" class="eval-list"><div class="note">まだ評価データがありません。</div></div></div>
   </section>
 
   <section id="view-tech" class="view">
@@ -265,19 +350,19 @@
 
     <div class="card">
       <h2>自己位置推定アルゴリズム</h2>
-      <div class="architecture">加速度 → Adaptive Step Detector ─┐
+      <div class="architecture">加速度 → Adaptive Step Detector + learned advance ─┐
 rotationRate + gravity → Gyro yaw ─┤
 Compass → slow drift correction ───┤
-DINOv2 / image descriptor ─────────┤
+DINOv2 sequence / image descriptor ──────┤
                                    ▼
-                         Bayesian Route Filter
+                Bayesian Route Filter + LOST FSM
                                    ▼
                        MAP位置 / Confidence</div>
       <div class="tech-grid top-gap">
         <div class="tech-item"><strong>Step</strong><span>rolling MAD + cadence + peak detector</span></div>
         <div class="tech-item"><strong>Turn</strong><span>gravity-projected gyroscope yaw</span></div>
-        <div class="tech-item"><strong>Localization</strong><span>Discrete Bayesian / HMM-style route filter</span></div>
-        <div class="tech-item"><strong>Graph</strong><span>Mutual nearest matching + order consistency + Dijkstra</span></div>
+        <div class="tech-item"><strong>Localization</strong><span>Discrete Bayesian filter + LOCALIZED/UNCERTAIN/LOST FSM</span></div>
+        <div class="tech-item"><strong>VPR</strong><span>DINOv2 + 4-frame sequence consistency</span></div><div class="tech-item"><strong>Evaluation</strong><span>Ground Truth / MAE / Median / P95 / GOAL率</span></div><div class="tech-item"><strong>Auto tuning</strong><span>GTからstep advance / heading σ / visual σを学習</span></div><div class="tech-item"><strong>Graph</strong><span>MNN + order + neighbor context + Dijkstra</span></div>
       </div>
     </div>
 
@@ -312,21 +397,22 @@ DINOv2 / image descriptor ─────────┤
   <section id="view-info" class="view">
     <h1>仕様・課題</h1>
     <div class="card">
-      <h2>V4で対応した課題</h2>
+      <h2>V5で対応した課題</h2>
       <ul class="compact-list">
-        <li>固定しきい値中心の歩数検出 → rolling MAD + 歩行周期による適応型Step Detector</li>
-        <li>コンパス中心の曲がり判定 → rotationRateを重力方向へ射影したGyro yawを主体に変更</li>
-        <li>MobileNet分類Embedding → DINOv2 image-feature-extractionへ変更</li>
-        <li>手動画像補正 → ナビ中の低頻度自動再ローカライズを追加</li>
-        <li>Graphの画像類似だけによる誤結合 → 相互最近傍・margin・順序整合・route競合防止を追加</li>
-        <li>技術構成が見えない → アプリ内に「技術」タブとCapability表示を追加</li>
-        <li>V1〜V3データ互換を維持</li>
+        <li>精度を測れない → Ground Truth記録とMAE / Median / P95 / GOAL成功率を追加</li>
+        <li>常にどこかを返す → LOCALIZED / UNCERTAIN / LOST状態機械を追加</li>
+        <li>画像1枚のPlace Recognition → 直近最大4フレームの時系列整合を追加</li>
+        <li>登録画像が疎い → ルート記録中の自動キーフレームを追加</li>
+        <li>ベイズ係数が固定 → GT履歴からstep advance / heading σ / visual σを自動学習</li>
+        <li>Graph誤結合 → 前後anchor距離と局所turn signatureの文脈検証を追加</li>
+        <li>負荷が見えない → Motion Hz / AI推論時間 / scan数等のRuntime Diagnosticsを追加</li>
+        <li>V4のAdaptive Step / Gyro turn / DINOv2 / Bayesian Filter / 自動再ローカライズを継承</li>
       </ul>
     </div>
     <div class="card">
       <h2>残る制約</h2>
       <div class="note">
-        ARKit/SLAMではないため絶対座標(x,y,z)は出ません。DINOv2を使っても、同じ外観の反復廊下や大きな視点差では曖昧性が残ります。自動カメラ照合はバッテリー・発熱とのトレードオフがあるため低頻度実行です。DINOv2モデルを未読込/取得できない場合は軽量画像特徴へフォールバックします。
+        ARKit/SLAMではないため絶対座標(x,y,z)は出ません。V5は曖昧なときにLOSTを返せるようにしましたが、反復廊下・大きな視点差・カメラ遮蔽では再ローカライズできない場合があります。評価値は登録ルート上の「歩数地点」を真値とした相対誤差であり、メートル測量精度ではありません。
       </div>
     </div>
   </section>
@@ -337,6 +423,7 @@ DINOv2 / image descriptor ─────────┤
   <button data-view="routes">ルート</button>
   <button data-view="nav">ナビ</button>
   <button data-view="graph">グラフ</button>
+  <button data-view="eval">評価</button>
   <button data-view="tech">技術</button>
   <button data-view="info">仕様</button>
 </nav>
@@ -350,6 +437,6 @@ DINOv2 / image descriptor ─────────┤
   </div>
 </div>
 
-<script src="./app.js?v=4.0.0"></script>
+<script src="./app.js?v=5.0.0"></script>
 </body>
 </html>

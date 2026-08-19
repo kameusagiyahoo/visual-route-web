@@ -1,53 +1,68 @@
-# Visual Route Lab v4
+# Visual Route Lab v5
 
-iPhone 15 + Safari + GitHub Pagesだけで動く、マップ不要の屋内ルート自己位置推定Webアプリです。
+iPhone Safariだけで動くマップレス屋内自己位置推定の研究基盤です。
 
-## V4の主な変更
+## V5の中心
 
+### Ground Truth / 定量評価
+ナビ中に「今ここ」を登録ルート上の既知地点として記録し、以下を自動集計します。
+
+- MAE（平均絶対誤差）
+- Median error
+- P95 error
+- GOAL成功率（±3歩）
+- Ground Truthで検証した画像補正成功率
+- LOST遷移数 / GT時LOST率
+
+### LOCALIZED / UNCERTAIN / LOST
+Bayesian Filterが常に位置を返す問題を避けるため、信頼度・方角整合・直近画像観測から状態を判定します。
+LOST時は位置を「不明」と表示し、自動画像再ローカライズを高頻度化します。
+
+### Sequence Visual Place Recognition
+単画像だけでなく、直近最大4回の画像照合候補と移動歩数の順序整合を使います。
+登録側も5歩ごとの自動キーフレームを取れるため、画像系列を作れます。
+
+### ベイズパラメータ自動学習
+Ground Truth 5点以上から、ルート/全体ごとに以下を調整します。
+
+- stepAdvance
+- headingSigma
+- visualSigma
+
+### Graph context
+共通Node判定に画像だけでなく、前後anchorまでの歩数差と局所turn signatureを追加しました。
+
+### Runtime Diagnostics
+- DeviceMotion event rate
+- DINOv2 inference median / P95
+- auto scan / accepted数
+- sequence frames
+- Battery API（対応時）
+- JS heap（対応時）
+
+## 技術スタック
+
+- HTML5 / CSS / Vanilla JavaScript
+- iPhone Safari / PWA
+- DeviceMotionEvent + rotationRate
+- DeviceOrientationEvent
+- MediaDevices.getUserMedia
+- IndexedDB
+- Service Worker / Cache API
+- Transformers.js
+- DINOv2-small
+- ONNX Runtime Web（Transformers.js内部）
+- WebGPU優先 / WASM fallback
 - Adaptive Step Detector
-  - rolling median / MADでノイズ床を推定
-  - 最近の歩行ピーク振幅からしきい値を追従
-  - 歩行周期（cadence）で二重検出/異常間隔を抑制
-- Gyro turn detection
-  - `DeviceMotionEvent.rotationRate`を利用
-  - angular velocityを重力ベクトル方向へ射影し、端末の持ち角度に依存しにくいyaw proxyを生成
-  - コンパスはslow drift correctionの補助へ格下げ
-- Visual Place Embedding
-  - `@huggingface/transformers@4.0.1`
-  - `Xenova/dinov2-small`
-  - `image-feature-extraction`
-  - WebGPUを先に試し、失敗時WASM q8
-  - AI未使用時はV2/V3の手作り画像特徴へfallback
-- Automatic Visual Relocalization
-  - ナビ中に低頻度でカメラ照合
-  - 一意性・候補差・現在beliefから大きく飛ぶかを評価して安全な時だけ自動補正
-- Safer Topological Graph
-  - mutual nearest neighbor
-  - best-vs-second margin
-  - route pair内の順序整合
-  - 1 nodeに同一routeが2回入るunionを禁止
-- 「技術」タブ
-  - 技術スタック
-  - アーキテクチャ
-  - ブラウザCapability
+- Gyro yaw + compass drift correction
+- Discrete Bayesian Route Filter
+- Sequence VPR
+- Topological Graph + Dijkstra
+- GitHub Pages
 
-## 不要
+## 更新
+既存リポジトリの `index.html / style.css / app.js / manifest.webmanifest / sw.js` をV5へ上書きしてください。
+V1〜V4の保存ルートは読み込みます。V5バックアップには評価データと学習パラメータも含みます。
 
-Expo / npm / Node.js / Mac / Xcode / Apple Developer Program / 自前バックエンド / 有料AI API
-
-## 更新方法
-
-既存GitHub Pages repositoryのrootで以下を上書きしてください。
-
-- index.html
-- style.css
-- app.js
-- manifest.webmanifest
-- sw.js
-
-Commit後、Safariでヘッダーが `v4.0` になれば完了です。
-
-## 重要な制約
-
-これはARKit/SLAMではありません。絶対座標 `(x,y,z)` は出ません。
-DINOv2は汎用視覚特徴であり、Visual Place Recognition専用fine-tuningモデルではありません。
+## 制約
+絶対座標(x,y,z)を出すSLAMではありません。評価単位は登録ルート上の「歩数地点」です。

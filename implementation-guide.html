@@ -1,18 +1,28 @@
-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Visual Route Lab v4 更新手順</title>
-<style>:root{color-scheme:dark;--bg:#0b1018;--p:#131b27;--l:#29364a;--t:#f3f6fb;--m:#9aa7b8;--a:#4d91ff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic",sans-serif;line-height:1.7}main{max-width:880px;margin:auto;padding:22px 16px 70px}h2{margin-top:34px;border-bottom:1px solid var(--l);padding-bottom:7px}p,li{color:#cbd4e1}.card{background:var(--p);border:1px solid var(--l);border-radius:13px;padding:14px;margin:12px 0}.code{white-space:pre;overflow:auto;background:#080e16;border:1px solid var(--l);border-radius:10px;padding:12px;font-family:ui-monospace,monospace;color:#d7e2f2}.note{border-left:4px solid var(--a);background:#101b2b;padding:11px 13px;border-radius:8px}</style></head><body><main>
-<h1>Visual Route Lab v4 更新手順</h1><p>既にV3がGitHub Pagesで動いている場合、新規Repositoryは不要です。</p>
-<h2>1. 上書き</h2><div class="code">index.html
-style.css
-app.js
-manifest.webmanifest
-sw.js</div><p>ZIPの5ファイルを既存Repositoryのrootへ上書きしてCommitします。</p>
-<h2>2. 確認</h2><ol><li>GitHub Pages URLをSafariで開く。</li><li>ヘッダーが <strong>v4.0</strong> なら成功。</li><li>下部に「技術」タブが増えていることを確認。</li></ol>
-<h2>3. 推奨初期テスト</h2><ol><li>センサーを許可。</li><li>20歩キャリブレーション。</li><li>「技術」でrotationRateが利用可能か確認。</li><li>DINOv2-smallを読み込む。</li><li>30〜60歩のルートを登録し、START/曲がり角/GOALで写真を撮る。</li><li>ナビ開始。自動画像再ローカライズをONにする。</li></ol>
-<h2>4. Adaptive Step Detector</h2><p>手動設定したthresholdは基準値として残りますが、歩行中はrolling MAD・最近の歩行ピーク・cadenceから「適応しきい値」を更新します。</p><div class="note">固定thresholdを完全に捨てるのではなく、基準値をfloorとして使うため、環境ノイズが一時的に低い時に感度が上がりすぎることを防ぎます。</div>
-<h2>5. Gyro turn</h2><p>rotationRateのx/y/z角速度を、accelerationIncludingGravityで得る重力方向に射影し、world verticalまわりのyaw proxyを作ります。端末を平ら/立てた時の差を減らします。Compassはゆっくりdriftを戻す補助だけに使います。</p>
-<h2>6. DINOv2</h2><p>Transformers.jsのimage-feature-extractionとしてDINOv2-smallを使います。WebGPUが使える場合はWebGPU/fp16を先に試し、初期化に失敗した場合はWASM/q8へfallbackします。</p><div class="note">初回モデルロードにはネット接続が必要です。モデルを読み込まなくても軽量画像特徴でナビは動きます。</div>
-<h2>7. 自動画像再ローカライズ</h2><p>ナビ中、設定間隔ごとに低解像度フレームを比較します。強く一意な一致だけbeliefへ自動投入します。現在推定から大きく飛ぶ候補は、非常に強い一致でなければ保留します。</p>
-<h2>8. Graph誤結合防止</h2><p>V4は画像類似度だけではmergeしません。相互最近傍、best/second margin、ルート間のマッチ順序、同一routeが同じclusterへ2回入らないことを確認してからNode統合します。</p>
-<h2>9. 技術タブ</h2><p>アプリのRuntime、ブラウザAPI、自己位置推定、AI、Graph、Privacy、実機Capabilityをアプリ自身から確認できます。</p>
-<h2>10. 残る制約</h2><ul><li>絶対座標(x,y,z)は出ません。</li><li>DINOv2はVPR専用fine-tuneモデルではありません。</li><li>自動カメラ+AIは発熱/電池消費を増やします。</li><li>反復模様の長い廊下は依然として難所です。</li></ul>
+<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Visual Route Lab v5 更新・評価手順</title><style>:root{color-scheme:dark;--bg:#0b1018;--panel:#131b27;--line:#2a3648;--text:#f2f5fa;--muted:#9ba8ba;--accent:#4d91ff;--good:#65c77d;--warn:#efb85e}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic",sans-serif;line-height:1.7}main{max-width:900px;margin:auto;padding:24px 16px 70px}h1{font-size:29px}h2{margin-top:36px;border-bottom:1px solid var(--line);padding-bottom:7px}p,li{color:#c8d1de}.note{border-left:4px solid var(--accent);background:#111b2a;border-radius:8px;padding:12px 14px}.good{border-left-color:var(--good);background:#102018}.warn{border-left-color:var(--warn);background:#211c12}code{background:#090e15;padding:2px 5px;border-radius:5px}.flow{overflow:auto;background:#0e151f;border:1px solid var(--line);border-radius:12px;padding:14px;white-space:pre;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}</style></head><body><main>
+<h1>Visual Route Lab v5</h1><p>V4が動いているGitHub Pagesへ、V5の5ファイルを上書きするだけです。</p>
+<div class="note good"><strong>上書き:</strong> index.html / style.css / app.js / manifest.webmanifest / sw.js</div>
+<h2>1. V5で最初にやること</h2><ol><li>20歩キャリブレーション。</li><li>30〜60歩のルートを登録。</li><li>「画像系列キーフレーム」をONにする。</li><li>同じルートを最低5回ナビ。</li><li>各回、Photo/Turn/GOAL地点でGround Truthを押す。</li></ol>
+<h2>2. Ground Truth</h2><div class="flow">実際の既知地点 24歩
+        ↓ GT
+推定MAP 21歩
+        ↓
+誤差 = |21 - 24| = 3歩
+        ↓
+MAE / Median / P95へ集計</div><p>これはメートル測量の真値ではなく、「登録ルート上の既知歩数地点」です。</p>
+<h2>3. LOST判定</h2><div class="flow">LOCALIZING
+   ↓
+LOCALIZED ← 強い画像再認識
+   ↓
+UNCERTAIN
+   ↓ 低信頼+方角不整合が継続
+LOST
+   ↓ 自動画像走査を高頻度化
+LOCALIZED</div><p>LOSTでは誤った位置を確定表示せず「不明」とします。</p>
+<h2>4. 画像系列</h2><p>V5は直近最大4回の画像候補について「ルート上でも同じ順番で進んでいるか」を加点します。単体で似た廊下があっても、A→B→Cの系列が違えば抑制できます。</p>
+<h2>5. 自動キーフレーム</h2><p>登録中は初期5歩間隔で低解像度画像を端末内に保存します。DINOv2が読み込まれていればEmbeddingも保存します。写真枚数とSafariストレージは増えるため、長距離では8歩間隔も利用してください。</p>
+<h2>6. パラメータ学習</h2><p>評価タブでGround Truthが5点以上になったら「GTから学習」を押します。</p><ul><li>stepAdvance: 検出1歩あたりルート上でどれだけ進むか</li><li>heading σ: 方角誤差をどこまで許容するか</li><li>visual σ: 画像観測を何歩幅に広げるか</li></ul><p>ルート選択時はそのルート専用、全ルート選択時はGlobal値を学習します。</p>
+<h2>7. Runtime Diagnostics</h2><p>評価タブにMotion Hz、DINOv2推論時間、auto scan数を表示します。長時間利用時はAI inference P95が大きく増えるか確認してください。</p>
+<h2>8. Graph</h2><p>V4のMNN/order検証に加え、V5は対応地点の前後anchor距離と局所turn signatureを比較します。「同じ見た目だが前後構造が違う場所」を統合しにくくします。</p>
+<h2>9. 推奨評価</h2><ol><li>同じルートを5回。</li><li>1走行3〜5個のGT。</li><li>合計20GT程度集める。</li><li>学習前のMAE/P95を記録。</li><li>パラメータ学習。</li><li>再度5回走行し、MAE/P95を比較。</li></ol>
+<div class="note warn">本質的制約: ARKit/SLAMではないため絶対座標(x,y,z)は出ません。V5の評価値は登録ルート上の相対位置精度です。</div>
 </main></body></html>

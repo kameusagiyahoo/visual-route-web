@@ -1,50 +1,51 @@
-# Visual Route Lab v4 — 実機チェック
+# Visual Route Lab v5 — 実機テスト
 
-## A. 更新
-- [ ] ヘッダーが v4.0
-- [ ] 登録 / ルート / ナビ / グラフ / 技術 / 仕様 の6タブ
-- [ ] V3以前の保存ルートが残っている
+## 更新
+- [ ] ヘッダー v5.0
+- [ ] 「評価」タブが追加
+- [ ] 「技術」タブが残っている
 
-## B. Adaptive Step Detector
-- [ ] センサー許可
+## 登録
 - [ ] 20歩キャリブレーション
-- [ ] 適応しきい値が歩行中に変化する
-- [ ] ケイデンスが歩行中に表示される
-- [ ] 10歩×5回で過検出/未検出を記録
-- [ ] スマホを振っただけでは歩数が大幅に増えない
+- [ ] 自動キーフレームON
+- [ ] STARTでrecord cameraが起動
+- [ ] 5歩程度ごとにキーフレーム枚数が増える
+- [ ] STOP後に画像付きroute保存
 
-## C. Gyro turn
-- [ ] Gyro yaw rateが表示される
-- [ ] iPhoneを平らに持って90°回る
-- [ ] iPhoneを立てて持って90°回る
-- [ ] どちらでもGyro相対角が概ね変化する
-- [ ] 曲がり角がgyro観測として記録される
+## ナビ / LOST
+- [ ] 初期状態 LOCALIZING
+- [ ] 安定時 LOCALIZED
+- [ ] 画像/方角が崩れたときUNCERTAINへ遷移
+- [ ] 低信頼が継続した場合LOST
+- [ ] LOST中は推定地点が「不明」
+- [ ] 強い画像系列一致でLOCALIZEDへ復帰
 
-## D. DINOv2
-- [ ] DINOv2-smallを読み込む
-- [ ] WebGPUまたはWASM backendが表示される
-- [ ] checkpointを撮影
-- [ ] ナビ画像照合でDINOv2スコアが使われる
-- [ ] AIロード失敗時もfallback特徴で動く
+## Sequence VPR
+- [ ] auto scanごとに「画像系列 1/4 → 4/4」
+- [ ] 最終照合にframe数表示
+- [ ] 単画像score + 系列supportが手動照合詳細に出る
 
-## E. 自動再ローカライズ
-- [ ] ナビ開始時に自動カメラpreviewが表示
-- [ ] 8秒程度で最終照合が更新される
-- [ ] 一致地点で自動補正される
-- [ ] 違う場所を映した時に遠距離jumpが抑制される
-- [ ] ナビ停止時にカメラが停止する
+## Ground Truth
+- [ ] checkpoint/turn/GOALを選択
+- [ ] 「今ここをGT記録」
+- [ ] 推定誤差が表示
+- [ ] 評価タブへ反映
 
-## F. Graph誤結合防止
-- [ ] 2ルート以上登録
-- [ ] 共通地点写真あり
-- [ ] グラフ再構築
-- [ ] 採用match数が表示
-- [ ] rejected mutual/margin/order/conflictが表示
-- [ ] 同一route内の別地点が1Nodeに潰れない
-- [ ] 共通地点は正しく1Nodeになる
+## 評価
+- [ ] GT 5点以上
+- [ ] MAE / Median / P95
+- [ ] GOAL成功率
+- [ ] CSV書き出し
+- [ ] GTから学習
+- [ ] Step advance / Heading σ / Visual σ更新
 
-## G. 技術タブ
-- [ ] 技術スタックが表示
-- [ ] rotationRate capabilityがセンサー許可後に更新
-- [ ] WebGPU capabilityが表示
-- [ ] AI backendがモデル読込後に更新
+## Graph
+- [ ] Graph再構築
+- [ ] 前後文脈NGカウンタが表示
+- [ ] 反復する似た場所が安易に同一Node化されない
+
+## Diagnostics
+- [ ] Motion Hz
+- [ ] AI inference median/P95（AI読込時）
+- [ ] Auto scans / accepted
+- [ ] Sequence frames
