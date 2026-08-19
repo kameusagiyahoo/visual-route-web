@@ -1,9 +1,9 @@
 {
-  "name": "Visual Route Lab v3",
+  "name": "Visual Route Lab v4",
   "short_name": "VisualRoute",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#0b1018",
   "theme_color": "#0b1018",
-  "description": "Mapless indoor route localization with Bayesian filtering and visual embeddings."
+  "description": "Mapless indoor route localization with adaptive steps, gyro turns, DINOv2 visual relocalization, Bayesian filtering, and topological graphs."
 }

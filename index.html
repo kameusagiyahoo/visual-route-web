@@ -8,12 +8,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Visual Route">
 <link rel="manifest" href="./manifest.webmanifest">
-<link rel="stylesheet" href="./style.css?v=3.0.0">
-<title>Visual Route Lab v3</title>
+<link rel="stylesheet" href="./style.css?v=4.0.0">
+<title>Visual Route Lab v4</title>
 </head>
 <body>
 <header>
-  <div class="header-title">Visual Route Lab <span class="version">v3.0</span></div>
+  <div class="header-title">Visual Route Lab <span class="version">v4.0</span></div>
   <div class="header-sub">Mapless indoor route localization / Safari only</div>
 </header>
 
@@ -49,17 +49,25 @@
         <button id="btnResetCalibration" class="btn secondary">初期値に戻す</button>
       </div>
       <div id="calibrationResult" class="small"></div>
+      <div class="divider"></div>
+      <div class="kv">
+        <div>適応しきい値</div><div id="effectiveThreshold">-- m/s²</div>
+        <div>推定ケイデンス</div><div id="cadenceStatus">-- steps/min</div>
+        <div>Gyro yaw rate</div><div id="gyroRate">-- °/s</div>
+        <div>Gyro相対角</div><div id="gyroYaw">--°</div>
+        <div>Turn detector</div><div id="gyroTurnStatus">待機</div>
+      </div>
     </div>
 
     <div class="card">
-      <h2>AI画像Embedding</h2>
+      <h2>Visual Place Embedding</h2>
       <div class="kv">
-        <div>モデル</div><div id="aiStatus">未読み込み（V2画像特徴で動作）</div>
+        <div>モデル</div><div id="aiStatus">未読み込み（軽量画像特徴で動作）</div>
         <div>実行Backend</div><div id="aiBackend">--</div>
         <div>WebGPU</div><div id="webgpuStatus">確認中</div>
       </div>
-      <button id="btnLoadAI" class="btn secondary top-gap">MobileNetを読み込む</button>
-      <div class="note">任意機能です。読み込むとチェックポイント画像をニューラルEmbeddingで比較します。失敗しても従来の軽量画像特徴へ自動フォールバックします。</div>
+      <button id="btnLoadAI" class="btn secondary top-gap">DINOv2-smallを読み込む</button>
+      <div class="note">DINOv2の汎用視覚特徴を場所照合用Embeddingとして利用します。WebGPUを先に試し、失敗時はWASMへフォールバックします。AIを読み込まなくても従来特徴で利用できます。</div>
     </div>
 
     <div class="metrics">
@@ -133,6 +141,36 @@
     </div>
 
     <div class="card">
+      <h2>自動画像再ローカライズ</h2>
+      <label class="toggle-row"><input id="autoRelocEnabled" type="checkbox" checked> ナビ中にカメラで自動補正する</label>
+      <div class="row top-gap">
+        <div>
+          <label>走査間隔</label>
+          <select id="autoRelocInterval">
+            <option value="5">5秒（高負荷）</option>
+            <option value="8" selected>8秒（推奨）</option>
+            <option value="12">12秒（省電力）</option>
+          </select>
+        </div>
+        <div>
+          <label>最低移動量</label>
+          <select id="autoRelocMinSteps">
+            <option value="2">2歩</option>
+            <option value="4" selected>4歩</option>
+            <option value="6">6歩</option>
+          </select>
+        </div>
+      </div>
+      <div class="auto-camera-wrap top-gap">
+        <video id="autoVideo" playsinline autoplay muted></video>
+        <div>
+          <div id="autoRelocStatus" class="small">ナビ開始時にカメラを起動します。</div>
+          <div id="autoRelocLast" class="small">最終照合: --</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>位置確率分布</h2>
       <canvas id="beliefCanvas" class="belief-canvas" width="680" height="150"></canvas>
       <div id="beliefCandidates" class="small">ルートを選択してください。</div>
@@ -164,7 +202,7 @@
       <h2>グラフ構築</h2>
       <div class="row">
         <button id="btnBuildGraph" class="btn">グラフを再構築</button>
-        <button id="btnLoadAIGraph" class="btn secondary">AIモデルを読み込む</button>
+        <button id="btnLoadAIGraph" class="btn secondary">DINOv2を読み込む</button>
       </div>
       <div id="graphStatus" class="note">未構築。チェックポイント写真が多いほど共通地点を見つけやすくなります。</div>
     </div>
@@ -172,6 +210,18 @@
     <div class="metrics">
       <div class="metric"><div class="metric-label">Nodes</div><div id="graphNodeCount" class="metric-value">0</div><div class="metric-sub">場所クラスタ</div></div>
       <div class="metric"><div class="metric-label">Edges</div><div id="graphEdgeCount" class="metric-value">0</div><div class="metric-sub">登録移動区間</div></div>
+    </div>
+
+    <div class="card">
+      <h2>誤結合防止</h2>
+      <div class="kv">
+        <div>採用match</div><div id="graphAccepted">0</div>
+        <div>相互最近傍NG</div><div id="graphRejectedMutual">0</div>
+        <div>類似度/候補差NG</div><div id="graphRejectedMargin">0</div>
+        <div>順序整合NG</div><div id="graphRejectedOrder">0</div>
+        <div>同一route競合NG</div><div id="graphRejectedConflict">0</div>
+      </div>
+      <div class="note top-gap">画像が似ているだけではNodeを統合しません。相互最近傍・第2候補との差・ルート順序整合・同一ルート重複禁止を通過した対応だけを採用します。</div>
     </div>
 
     <div class="card">
@@ -187,26 +237,96 @@
     <div id="graphNodesList"></div>
   </section>
 
+  <section id="view-tech" class="view">
+    <h1>技術スタック</h1>
+    <p class="lead">このアプリがiPhone Safariだけで何を使っているかを、実装層ごとに確認できます。バックエンドはありません。</p>
+
+    <div class="card">
+      <h2>実行・配信</h2>
+      <div class="tech-grid">
+        <div class="tech-item"><strong>Runtime</strong><span>iPhone Safari / Home Screen Web App</span></div>
+        <div class="tech-item"><strong>Frontend</strong><span>HTML5 + CSS + Vanilla JavaScript</span></div>
+        <div class="tech-item"><strong>Hosting</strong><span>GitHub Pages / HTTPS</span></div>
+        <div class="tech-item"><strong>Offline</strong><span>Service Worker / Cache API</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>ブラウザAPI</h2>
+      <div class="tech-grid">
+        <div class="tech-item"><strong>IMU</strong><span>DeviceMotionEvent acceleration / rotationRate</span></div>
+        <div class="tech-item"><strong>方角</strong><span>DeviceOrientationEvent / webkitCompassHeading</span></div>
+        <div class="tech-item"><strong>Camera</strong><span>MediaDevices.getUserMedia</span></div>
+        <div class="tech-item"><strong>Storage</strong><span>IndexedDB + File/Blob</span></div>
+        <div class="tech-item"><strong>画面維持</strong><span>Screen Wake Lock API（対応時）</span></div>
+        <div class="tech-item"><strong>PWA</strong><span>Web App Manifest</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>自己位置推定アルゴリズム</h2>
+      <div class="architecture">加速度 → Adaptive Step Detector ─┐
+rotationRate + gravity → Gyro yaw ─┤
+Compass → slow drift correction ───┤
+DINOv2 / image descriptor ─────────┤
+                                   ▼
+                         Bayesian Route Filter
+                                   ▼
+                       MAP位置 / Confidence</div>
+      <div class="tech-grid top-gap">
+        <div class="tech-item"><strong>Step</strong><span>rolling MAD + cadence + peak detector</span></div>
+        <div class="tech-item"><strong>Turn</strong><span>gravity-projected gyroscope yaw</span></div>
+        <div class="tech-item"><strong>Localization</strong><span>Discrete Bayesian / HMM-style route filter</span></div>
+        <div class="tech-item"><strong>Graph</strong><span>Mutual nearest matching + order consistency + Dijkstra</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>画像AI</h2>
+      <div class="tech-grid">
+        <div class="tech-item"><strong>Library</strong><span>@huggingface/transformers 4.0.1（CDN dynamic import）</span></div>
+        <div class="tech-item"><strong>Model</strong><span>Xenova/dinov2-small / image-feature-extraction</span></div>
+        <div class="tech-item"><strong>Runtime</strong><span>Transformers.js → ONNX Runtime Web</span></div>
+        <div class="tech-item"><strong>Acceleration</strong><span>WebGPU優先 / WASM fallback</span></div>
+        <div class="tech-item"><strong>Fallback</strong><span>RGB + luminance + edge + perceptual hash</span></div>
+        <div class="tech-item"><strong>Privacy</strong><span>推論は端末内。画像アップロード用APIなし</span></div>
+      </div>
+      <div class="note top-gap">DINOv2はVisual Place Recognition専用にfine-tuneされたモデルではなく、自己教師ありの汎用視覚特徴です。V4では分類用MobileNetより場所照合に適した特徴抽出器として採用し、将来の専用VPRモデルへ差し替え可能なAdapter構造にしています。</div>
+    </div>
+
+    <div class="card">
+      <h2>この端末のCapability</h2>
+      <div class="kv">
+        <div>Secure Context</div><div id="capSecure">--</div>
+        <div>DeviceMotion</div><div id="capMotion">--</div>
+        <div>rotationRate</div><div id="capGyro">--</div>
+        <div>Camera API</div><div id="capCamera">--</div>
+        <div>IndexedDB</div><div id="capIndexedDB">--</div>
+        <div>Wake Lock</div><div id="capWakeLock">--</div>
+        <div>WebGPU</div><div id="capWebGPU">--</div>
+        <div>AI backend</div><div id="capAIBackend">未読み込み</div>
+      </div>
+    </div>
+  </section>
+
   <section id="view-info" class="view">
     <h1>仕様・課題</h1>
     <div class="card">
-      <h2>V3で追加した機能</h2>
+      <h2>V4で対応した課題</h2>
       <ul class="compact-list">
-        <li>HMM型ベイズフィルタでルート全地点の確率分布を保持</li>
-        <li>歩数・相対方角・曲がり角・画像観測を同一の確率分布へ統合</li>
-        <li>確率分布のエントロピーとピーク集中度から信頼度を計算</li>
-        <li>MobileNet v2 (alpha 0.25) の画像Embeddingをブラウザ内で任意利用</li>
-        <li>AIモデルが使えない場合はV2の手作り特徴へ自動フォールバック</li>
-        <li>複数ルートの共通チェックポイントをクラスタリングしてTopological Mapを生成</li>
-        <li>ルートグラフ上でDijkstra最短経路を計算</li>
-        <li>V1/V2データをそのまま読み込み可能</li>
-        <li>V2の20歩キャリブレーション・画像品質判定・バックアップ等を継承</li>
+        <li>固定しきい値中心の歩数検出 → rolling MAD + 歩行周期による適応型Step Detector</li>
+        <li>コンパス中心の曲がり判定 → rotationRateを重力方向へ射影したGyro yawを主体に変更</li>
+        <li>MobileNet分類Embedding → DINOv2 image-feature-extractionへ変更</li>
+        <li>手動画像補正 → ナビ中の低頻度自動再ローカライズを追加</li>
+        <li>Graphの画像類似だけによる誤結合 → 相互最近傍・margin・順序整合・route競合防止を追加</li>
+        <li>技術構成が見えない → アプリ内に「技術」タブとCapability表示を追加</li>
+        <li>V1〜V3データ互換を維持</li>
       </ul>
     </div>
     <div class="card">
       <h2>残る制約</h2>
       <div class="note">
-        ARKit/SLAMではないため絶対座標(x,y,z)は出ません。加速度ベース歩数と相対方角には誤差が残ります。MobileNet Embeddingは意味的耐性を改善しますが、似た廊下・大きな視点差では曖昧性が残ります。AIモデルは初回にネットワークから読み込むため、オフライン時はV2画像特徴へフォールバックします。
+        ARKit/SLAMではないため絶対座標(x,y,z)は出ません。DINOv2を使っても、同じ外観の反復廊下や大きな視点差では曖昧性が残ります。自動カメラ照合はバッテリー・発熱とのトレードオフがあるため低頻度実行です。DINOv2モデルを未読込/取得できない場合は軽量画像特徴へフォールバックします。
       </div>
     </div>
   </section>
@@ -217,6 +337,7 @@
   <button data-view="routes">ルート</button>
   <button data-view="nav">ナビ</button>
   <button data-view="graph">グラフ</button>
+  <button data-view="tech">技術</button>
   <button data-view="info">仕様</button>
 </nav>
 
@@ -229,6 +350,6 @@
   </div>
 </div>
 
-<script src="./app.js?v=3.0.0"></script>
+<script src="./app.js?v=4.0.0"></script>
 </body>
 </html>

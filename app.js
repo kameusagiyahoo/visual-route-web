@@ -1,7 +1,7 @@
 (() => {
 'use strict';
 
-const APP_VERSION = '3.0.0';
+const APP_VERSION = '4.0.0';
 const DB_NAME = 'visual-route-web-v1';
 const DB_VERSION = 2;
 const DEFAULT_THRESHOLD = 1.10;
@@ -1940,6 +1940,956 @@ async function init() {
   try { await openDB(); await refreshRoutes(); } catch (error) { console.error(error); }
   renderAIStatus();
   renderLive(); renderNav(); renderCompassQuality(); renderGraph();
+}
+
+
+/* ===========================
+   V4 overlay
+   =========================== */
+
+const V4_HF_CDN = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.1';
+const V4_PLACE_MODEL = 'Xenova/dinov2-small';
+const V4_PLACE_MODEL_LABEL = 'DINOv2-small';
+const V4_AUTO_STRONG = 0.86;
+const V4_AUTO_VERY_STRONG = 0.92;
+const V4_GRAPH_AI_THRESHOLD = 0.90;
+const V4_GRAPH_HAND_THRESHOLD = 0.91;
+
+state.gyro = {
+  available: false,
+  yawRate: 0,
+  yaw: 0,
+  lastT: null,
+  lastRotationAt: 0,
+  source: 'compass fallback',
+};
+state.stepAdaptive = {
+  samples: [],
+  acceptedPeaks: [],
+  intervals: [],
+  effectiveThreshold: state.detector.threshold,
+  cadenceSpm: null,
+  lastAdaptAt: 0,
+};
+state.recordTurns = [];
+state.navTurns = [];
+state.turnDetector = { anchorYaw: 0, lastRotatingAt: 0, emittedAt: 0, maxDelta: 0 };
+state.autoReloc = {
+  enabled: true,
+  stream: null,
+  timer: null,
+  busy: false,
+  lastScanAt: 0,
+  lastScanSteps: 0,
+  lastAppliedAt: 0,
+};
+state.ai = { status: 'idle', model: null, backend: null, error: null, loading: null, kind: 'dinov2' };
+state.graph.stats = { accepted: 0, rejectedMutual: 0, rejectedMargin: 0, rejectedOrder: 0, rejectedConflict: 0 };
+
+function median(values) {
+  if (!values?.length) return null;
+  const a = [...values].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+function rollingMAD(values, center = null) {
+  if (!values?.length) return 0;
+  const c = center ?? median(values) ?? 0;
+  return median(values.map((v) => Math.abs(v - c))) || 0;
+}
+
+function currentRelativeHeading() {
+  if (state.gyro.available && (state.recording || state.navActive)) return state.gyro.yaw;
+  const start = state.recording ? state.recordStartHeading : state.navActive ? state.navStartHeading : null;
+  return relHeading(start, state.heading) ?? 0;
+}
+
+function resetGyroRouteFrame() {
+  state.gyro.yaw = 0;
+  state.gyro.lastT = null;
+  state.gyro.lastRotationAt = 0;
+  state.turnDetector = { anchorYaw: 0, lastRotatingAt: performance.now(), emittedAt: 0, maxDelta: 0 };
+}
+
+function updateGyro(event, now) {
+  const rr = event.rotationRate;
+  const ag = event.accelerationIncludingGravity;
+  if (!rr || !ag) {
+    state.gyro.available = false;
+    state.gyro.source = 'compass fallback';
+    return;
+  }
+  const wx = Number(rr.beta), wy = Number(rr.gamma), wz = Number(rr.alpha);
+  const gx = Number(ag.x), gy = Number(ag.y), gz = Number(ag.z);
+  if (![wx, wy, wz, gx, gy, gz].every(Number.isFinite)) {
+    state.gyro.available = false; return;
+  }
+  const gnorm = Math.sqrt(gx * gx + gy * gy + gz * gz) || 1;
+  // rotationRate axes: beta=x, gamma=y, alpha=z. Project angular velocity onto gravity axis.
+  // This approximates rotation around world vertical regardless of whether the phone is flat or upright.
+  const yawRate = (wx * gx + wy * gy + wz * gz) / gnorm;
+  state.gyro.yawRate = 0.68 * state.gyro.yawRate + 0.32 * yawRate;
+  state.gyro.available = true;
+  state.gyro.source = 'rotationRate · gravity projection';
+
+  if (state.gyro.lastT != null && (state.recording || state.navActive) && !state.measurementPaused) {
+    const dt = clamp((now - state.gyro.lastT) / 1000, 0, 0.12);
+    state.gyro.yaw += state.gyro.yawRate * dt;
+    if (Math.abs(state.gyro.yawRate) >= 7) state.gyro.lastRotationAt = now;
+    processGyroTurn(now);
+  }
+  state.gyro.lastT = now;
+}
+
+function compassCorrectionWeight() {
+  if (state.headingSource !== 'webkitCompassHeading') return 0.0015;
+  if (typeof state.compassAccuracy !== 'number' || state.compassAccuracy < 0) return 0.0025;
+  if (state.compassAccuracy <= 20) return 0.006;
+  if (state.compassAccuracy <= 40) return 0.002;
+  return 0.0005;
+}
+
+function applyCompassDriftCorrection() {
+  if (!state.gyro.available || !(state.recording || state.navActive) || Math.abs(state.gyro.yawRate) > 14) return;
+  const start = state.recording ? state.recordStartHeading : state.navStartHeading;
+  const target = relHeading(start, state.heading);
+  if (target == null) return;
+  const correction = signedAngle(normDeg(state.gyro.yaw), normDeg(target));
+  state.gyro.yaw += correction * compassCorrectionWeight();
+}
+
+function processGyroTurn(now) {
+  const td = state.turnDetector;
+  const delta = state.gyro.yaw - td.anchorYaw;
+  td.maxDelta = Math.max(td.maxDelta || 0, Math.abs(delta));
+  const settled = now - state.gyro.lastRotationAt >= 220;
+  const enoughTurn = Math.abs(delta) >= 36;
+  const cooldown = now - td.emittedAt >= 900;
+  if (!enoughTurn || !settled || !cooldown) return;
+
+  const turn = {
+    t: Date.now(),
+    steps: state.recording ? state.recordSteps : state.navRawSteps,
+    relHeading: state.gyro.yaw,
+    delta,
+    source: 'gyro',
+  };
+  td.anchorYaw = state.gyro.yaw;
+  td.maxDelta = 0;
+  td.emittedAt = now;
+
+  if (state.recording) {
+    state.recordTurns.push(turn);
+    $('gyroTurnStatus').textContent = `記録: ${turn.steps}歩 / ${turn.delta > 0 ? '右' : '左'} ${Math.abs(turn.delta).toFixed(0)}°`;
+  }
+  if (state.navActive) {
+    state.navTurns.push(turn);
+    matchGyroTurnToRoute(turn);
+    $('gyroTurnStatus').textContent = `ナビ: ${turn.steps}歩 / ${turn.delta > 0 ? '右' : '左'} ${Math.abs(turn.delta).toFixed(0)}°`;
+  }
+}
+
+function matchGyroTurnToRoute(navTurn) {
+  const route = state.navRoute;
+  if (!route?.turns?.length) return;
+  const stats = beliefStats();
+  let best = null;
+  for (let i = 0; i < route.turns.length; i += 1) {
+    const rt = route.turns[i];
+    if (Math.sign(rt.delta) !== Math.sign(navTurn.delta)) continue;
+    const angleError = Math.abs(Math.abs(rt.delta) - Math.abs(navTurn.delta));
+    if (angleError > 65) continue;
+    const positionError = Math.abs((rt.steps ?? 0) - stats.map);
+    const score = angleError * 0.55 + positionError * 2.2;
+    if (!best || score < best.score) best = { index: i, rt, score };
+  }
+  if (!best) return;
+  beliefObserveTurn(best.rt.steps, best.score < 35 ? 5.2 : 3.2);
+  state.lastTurnCorrection = { at: Date.now(), routeTurn: best.index + 1, target: best.rt.steps, source: 'gyro' };
+}
+
+function updateAdaptiveThreshold(now, value) {
+  const a = state.stepAdaptive;
+  a.samples.push({ t: now, v: value });
+  while (a.samples.length && now - a.samples[0].t > 5000) a.samples.shift();
+  if (now - a.lastAdaptAt < 500) return;
+  a.lastAdaptAt = now;
+
+  const vals = a.samples.map((x) => x.v);
+  const med = median(vals) ?? 0;
+  const mad = rollingMAD(vals, med);
+  const noiseThreshold = med + Math.max(0.18, mad * 3.0);
+  const recentPeaks = a.acceptedPeaks.filter((p) => now - p.t < 12000).map((p) => p.v);
+  const gaitPeak = median(recentPeaks);
+  const gaitThreshold = gaitPeak ? gaitPeak * 0.52 : state.detector.threshold;
+  const baseFloor = state.detector.threshold * 0.58;
+  a.effectiveThreshold = clamp(Math.max(baseFloor, noiseThreshold, gaitThreshold), 0.32, 2.8);
+
+  const intervals = a.intervals.filter((x) => now - x.t < 12000).map((x) => x.dt);
+  const cadenceMs = median(intervals);
+  a.cadenceSpm = cadenceMs ? 60000 / cadenceMs : null;
+}
+
+function acceptAdaptivePeak(now, amplitude) {
+  const a = state.stepAdaptive;
+  const dt = now - state.detector.lastStepAt;
+  const recentIntervals = a.intervals.slice(-7).map((x) => x.dt);
+  const cadence = median(recentIntervals);
+  let minDt = 270, maxDt = 1200;
+  if (cadence && cadence >= 300 && cadence <= 1000) {
+    minDt = Math.max(260, cadence * 0.52);
+    maxDt = Math.min(1300, cadence * 1.75);
+  }
+  if (dt < minDt) return false;
+  // After a long stop, allow re-acquisition immediately instead of rejecting by old cadence.
+  if (dt > 2200) a.intervals = [];
+  else if (dt > maxDt && cadence && a.intervals.length >= 3) return false;
+
+  // Large arbitrary phone rotation can create acceleration spikes. Require a stronger peak while rotating fast.
+  const gyroPenalty = Math.abs(state.gyro.yawRate) > 180 ? 1.22 : 1.0;
+  if (amplitude < a.effectiveThreshold * gyroPenalty) return false;
+
+  if (state.detector.lastStepAt > 0 && dt < 1800) a.intervals.push({ t: now, dt });
+  a.acceptedPeaks.push({ t: now, v: amplitude });
+  while (a.acceptedPeaks.length && now - a.acceptedPeaks[0].t > 15000) a.acceptedPeaks.shift();
+  while (a.intervals.length && now - a.intervals[0].t > 15000) a.intervals.shift();
+  state.detector.lastStepAt = now;
+  countStep();
+  return true;
+}
+
+function detectPeak(now, value) {
+  const d = state.detector;
+  const p2 = d.p2, p1 = d.p1;
+  const threshold = state.stepAdaptive.effectiveThreshold || d.threshold;
+  const isPeak = p1 > p2 && p1 >= value && p1 >= threshold;
+  if (isPeak) acceptAdaptivePeak(now, p1);
+  d.p2 = p1; d.p1 = value;
+}
+
+function onMotion(event) {
+  const now = performance.now();
+  const raw = calculateDynamicAcceleration(event);
+  if (raw == null) return;
+  state.detector.smooth = 0.70 * state.detector.smooth + 0.30 * raw;
+  state.dynamicAcc = state.detector.smooth;
+  state.motionActive = true;
+  setDot('motionDot', 'ok');
+  $('motionStatus').textContent = 'DeviceMotion: 受信中';
+
+  updateGyro(event, now);
+  updateAdaptiveThreshold(now, state.detector.smooth);
+
+  if (state.calibrating && !state.measurementPaused) state.calibrationSamples.push({ t: now, v: state.detector.smooth });
+  if (!state.measurementPaused) detectPeak(now, state.detector.smooth);
+  renderLive();
+}
+
+function onOrientation(event) {
+  let nextHeading = null;
+  if (typeof event.webkitCompassHeading === 'number' && !Number.isNaN(event.webkitCompassHeading)) {
+    nextHeading = normDeg(event.webkitCompassHeading);
+    state.headingSource = 'webkitCompassHeading';
+    state.compassAccuracy = typeof event.webkitCompassAccuracy === 'number' ? event.webkitCompassAccuracy : null;
+  } else if (typeof event.alpha === 'number' && !Number.isNaN(event.alpha)) {
+    nextHeading = normDeg(360 - event.alpha);
+    state.headingSource = 'alpha';
+    state.compassAccuracy = null;
+  }
+  if (nextHeading != null) state.heading = smoothAngle(state.heading, nextHeading);
+  state.orientation = { alpha: event.alpha, beta: event.beta, gamma: event.gamma };
+  state.orientationActive = true;
+  setDot('orientDot', 'ok');
+  $('orientStatus').textContent = `方角: 受信中 (${state.headingSource})`;
+  applyCompassDriftCorrection();
+  renderCompassQuality(); renderLive(); renderNav();
+}
+
+function countStep() {
+  if (state.calibrating) return;
+  const h = currentRelativeHeading();
+  if (state.recording) {
+    state.recordSteps += 1;
+    state.recordEvents.push({
+      t: Date.now(), steps: state.recordSteps, heading: state.heading,
+      relHeading: h, gyroRelHeading: h,
+      orientation: { ...state.orientation },
+      cadenceSpm: state.stepAdaptive.cadenceSpm,
+      effectiveThreshold: state.stepAdaptive.effectiveThreshold,
+    });
+  }
+  if (state.navActive) {
+    state.navRawSteps += 1;
+    const ev = { t: Date.now(), steps: state.navRawSteps, relHeading: h, gyroRelHeading: h, heading: state.heading };
+    state.navEvents.push(ev);
+    beliefPredictOneStep();
+    beliefObserveHeading(h);
+  }
+  renderLive(); renderNav();
+}
+
+function detectTurns(events) {
+  if (!events?.length) return [];
+  const out = [];
+  let anchor = events[0].gyroRelHeading ?? events[0].relHeading ?? 0;
+  let anchorStep = events[0].steps ?? 0;
+  for (const ev of events) {
+    const current = ev.gyroRelHeading ?? ev.relHeading ?? 0;
+    const delta = current - anchor;
+    if (Math.abs(delta) >= 38 && (ev.steps ?? 0) - anchorStep >= 1) {
+      out.push({ steps: ev.steps, relHeading: current, delta, source: ev.gyroRelHeading != null ? 'gyro' : 'orientation' });
+      anchor = current; anchorStep = ev.steps ?? anchorStep;
+    }
+  }
+  return out;
+}
+
+function resetAdaptiveWalkingState() {
+  state.stepAdaptive.samples = [];
+  state.stepAdaptive.acceptedPeaks = [];
+  state.stepAdaptive.intervals = [];
+  state.stepAdaptive.effectiveThreshold = state.detector.threshold;
+  state.stepAdaptive.cadenceSpm = null;
+  state.stepAdaptive.lastAdaptAt = 0;
+}
+
+async function startRecording() {
+  if (!ensureSensorReadyForRoute()) return;
+  if (state.calibrating) return;
+  state.recording = true;
+  state.recordSteps = 0;
+  state.recordStartAt = Date.now();
+  state.recordStartHeading = state.heading;
+  state.recordEvents = [{ t: Date.now(), steps: 0, heading: state.heading, relHeading: 0, gyroRelHeading: 0, orientation: { ...state.orientation } }];
+  state.recordCheckpoints = [];
+  state.recordTurns = [];
+  state.measurementPaused = false;
+  resetDetectorTransient(); resetAdaptiveWalkingState(); resetGyroRouteFrame();
+  $('recordButtons').innerHTML = `
+    <button id="btnStopRecord" class="btn danger">STOP 保存</button>
+    <button id="btnCheckpoint" class="btn secondary">現在地点を写真で記録</button>`;
+  $('btnStopRecord').onclick = stopRecording;
+  $('btnCheckpoint').onclick = () => openCamera('checkpoint');
+  await requestWakeLock(); renderLive();
+}
+
+async function stopRecording() {
+  state.recording = false; releaseWakeLock();
+  if (state.recordSteps < 3) { alert('歩数が少なすぎるため保存しません。'); resetRecordUI(); return; }
+  const turns = state.recordTurns.length ? state.recordTurns : detectTurns(state.recordEvents);
+  const route = {
+    schemaVersion: 4, appVersion: APP_VERSION,
+    id: `route-${Date.now()}`,
+    name: $('routeName').value.trim() || '無題ルート',
+    createdAt: new Date().toISOString(), durationMs: Date.now() - state.recordStartAt,
+    totalSteps: state.recordSteps, strideM: STRIDE_M,
+    startHeading: state.recordStartHeading, stepThreshold: state.detector.threshold,
+    adaptiveStep: true, headingMode: state.gyro.available ? 'gyro-gravity-projection+compass-drift' : 'compass-fallback',
+    events: state.recordEvents, turns, checkpoints: state.recordCheckpoints,
+  };
+  await putRoute(route);
+  alert(`保存しました\n${route.name}\n${route.totalSteps}歩 / Gyro曲がり${route.turns.length} / 写真${route.checkpoints.length}枚`);
+  resetRecordUI(); await refreshRoutes();
+}
+
+function renderLive() {
+  $('recordSteps').textContent = state.recordSteps;
+  $('dynamicAcc').textContent = state.dynamicAcc.toFixed(2);
+  $('absoluteHeading').textContent = state.heading == null ? '--°' : `${state.heading.toFixed(0)}°`;
+  const relative = state.recording ? currentRelativeHeading() : null;
+  $('relativeHeading').textContent = relative == null ? '--°' : `${relative.toFixed(0)}°`;
+  $('compassAccuracy').textContent = typeof state.compassAccuracy === 'number' && state.compassAccuracy >= 0 ? `±${state.compassAccuracy.toFixed(0)}°` : '--';
+  ['alpha', 'beta', 'gamma'].forEach((key) => { const v = state.orientation[key]; $(key).textContent = typeof v === 'number' ? `${v.toFixed(1)}°` : '--°'; });
+  $('effectiveThreshold').textContent = `${(state.stepAdaptive.effectiveThreshold || state.detector.threshold).toFixed(2)} m/s²`;
+  $('cadenceStatus').textContent = state.stepAdaptive.cadenceSpm ? `${state.stepAdaptive.cadenceSpm.toFixed(0)} steps/min` : '-- steps/min';
+  $('gyroRate').textContent = state.gyro.available ? `${state.gyro.yawRate.toFixed(1)} °/s` : 'rotationRate unavailable';
+  $('gyroYaw').textContent = state.gyro.available && (state.recording || state.navActive) ? `${state.gyro.yaw.toFixed(1)}°` : '--°';
+  if (!state.gyro.available) $('gyroTurnStatus').textContent = 'rotationRateなし → 方角fallback';
+  if (state.recording) $('elapsed').textContent = fmtTime(Date.now() - state.recordStartAt);
+}
+
+function flattenFeatureOutput(output) {
+  let data = null, dims = null;
+  if (output?.data && ArrayBuffer.isView(output.data)) { data = Array.from(output.data); dims = output.dims || output.shape || null; }
+  else if (typeof output?.tolist === 'function') {
+    const nested = output.tolist();
+    const flat = [];
+    const walk = (x) => Array.isArray(x) ? x.forEach(walk) : flat.push(Number(x));
+    walk(nested); data = flat; dims = output.dims || output.shape || null;
+  } else if (Array.isArray(output)) {
+    const flat = []; const walk = (x) => Array.isArray(x) ? x.forEach(walk) : flat.push(Number(x)); walk(output); data = flat;
+  }
+  if (!data?.length) return null;
+  // DINO can expose token embeddings. Use the CLS token instead of flattening all patch tokens.
+  if (dims?.length >= 3 && Number(dims[dims.length - 1]) > 0) {
+    data = data.slice(0, Number(dims[dims.length - 1]));
+  }
+  let norm = Math.sqrt(data.reduce((s, v) => s + v * v, 0)) || 1;
+  return data.map((v) => Number((v / norm).toFixed(6)));
+}
+
+async function loadAIModel() {
+  if (state.ai.status === 'ready') return state.ai.model;
+  if (state.ai.loading) return state.ai.loading;
+  state.ai.status = 'loading'; renderAIStatus();
+  state.ai.loading = (async () => {
+    try {
+      const hf = await import(V4_HF_CDN);
+      let extractor = null;
+      if (navigator.gpu) {
+        try {
+          extractor = await hf.pipeline('image-feature-extraction', V4_PLACE_MODEL, { device: 'webgpu', dtype: 'fp16' });
+          state.ai.backend = 'WebGPU / fp16';
+        } catch (webgpuError) {
+          console.warn('WebGPU DINOv2 load failed, fallback to WASM', webgpuError);
+        }
+      }
+      if (!extractor) {
+        extractor = await hf.pipeline('image-feature-extraction', V4_PLACE_MODEL, { dtype: 'q8' });
+        state.ai.backend = 'WASM / q8';
+      }
+      state.ai.model = extractor;
+      state.ai.status = 'ready'; state.ai.error = null; state.ai.kind = 'dinov2';
+      renderAIStatus(); renderTechCapabilities();
+      return extractor;
+    } catch (error) {
+      state.ai.status = 'error'; state.ai.error = error?.message || String(error);
+      renderAIStatus(); renderTechCapabilities(); throw error;
+    } finally { state.ai.loading = null; }
+  })();
+  return state.ai.loading;
+}
+
+function renderAIStatus() {
+  if (!$('aiStatus')) return;
+  $('webgpuStatus').textContent = navigator.gpu ? '利用可能' : '未検出';
+  if (state.ai.status === 'ready') {
+    $('aiStatus').textContent = `${V4_PLACE_MODEL_LABEL} 準備完了`;
+    $('aiStatus').className = 'ai-ready'; $('aiBackend').textContent = state.ai.backend || '--';
+    $('btnLoadAI').textContent = 'DINOv2読み込み済み'; $('btnLoadAI').disabled = true;
+    if ($('btnLoadAIGraph')) { $('btnLoadAIGraph').textContent = 'DINOv2読み込み済み'; $('btnLoadAIGraph').disabled = true; }
+  } else if (state.ai.status === 'loading') {
+    $('aiStatus').textContent = 'DINOv2をダウンロード/初期化中…'; $('aiStatus').className = 'ai-loading'; $('aiBackend').textContent = '--';
+  } else if (state.ai.status === 'error') {
+    $('aiStatus').textContent = `失敗: ${state.ai.error || 'unknown'}（軽量特徴へfallback）`; $('aiStatus').className = 'ai-error'; $('aiBackend').textContent = '--';
+  } else {
+    $('aiStatus').textContent = '未読み込み（軽量画像特徴で動作）'; $('aiStatus').className = ''; $('aiBackend').textContent = '--';
+  }
+}
+
+async function extractPlaceEmbedding(blob) {
+  if (state.ai.status !== 'ready' || !state.ai.model || !(blob instanceof Blob)) return null;
+  const url = URL.createObjectURL(blob);
+  try {
+    const output = await state.ai.model(url);
+    return flattenFeatureOutput(output);
+  } finally { URL.revokeObjectURL(url); }
+}
+
+async function ensureAIEmbedding(cp) {
+  if (cp.placeEmbedding?.model === V4_PLACE_MODEL && cp.placeEmbedding?.values?.length) return cp.placeEmbedding.values;
+  if (state.ai.status !== 'ready' || !(cp.blob instanceof Blob)) return null;
+  const values = await extractPlaceEmbedding(cp.blob);
+  if (values?.length) cp.placeEmbedding = { model: V4_PLACE_MODEL, values };
+  return values;
+}
+
+function checkpointPlaceEmbedding(cp) {
+  return cp?.placeEmbedding?.model === V4_PLACE_MODEL ? cp.placeEmbedding.values : null;
+}
+
+async function captureVideoFrameFrom(video, maxWidth = 640) {
+  if (!video || video.videoWidth < 2 || video.videoHeight < 2) throw new Error('カメラ映像がまだ準備できていません');
+  const scale = Math.min(1, maxWidth / video.videoWidth);
+  const width = Math.max(1, Math.round(video.videoWidth * scale));
+  const height = Math.max(1, Math.round(video.videoHeight * scale));
+  const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+  canvas.getContext('2d').drawImage(video, 0, 0, width, height);
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.74));
+  const descriptor = computeDescriptorV2(canvas);
+  const placeEmbedding = state.ai.status === 'ready' ? await extractPlaceEmbedding(blob) : null;
+  return { blob, descriptor, placeEmbedding };
+}
+
+async function captureVideoFrame() {
+  const video = $('video');
+  if (video.videoWidth < 2 || video.videoHeight < 2) await sleep(250);
+  return captureVideoFrameFrom(video, 720);
+}
+
+async function captureCamera() {
+  try {
+    const snap = await captureVideoFrame();
+    if (state.cameraMode === 'checkpoint') {
+      if (!state.recording) { closeCamera(); return; }
+      const quality = imageQualityMessage(snap.descriptor);
+      if (!quality.ok && !confirm(`画像品質に注意: ${quality.text}\nそれでも保存しますか？`)) { closeCamera(); return; }
+      state.recordCheckpoints.push({
+        id: `cp-${Date.now()}`, steps: state.recordSteps, heading: state.heading,
+        relHeading: currentRelativeHeading(), blob: snap.blob, descriptor: snap.descriptor,
+        placeEmbedding: snap.placeEmbedding ? { model: V4_PLACE_MODEL, values: snap.placeEmbedding } : null,
+      });
+      closeCamera(); alert(`${state.recordSteps}歩地点の画像を保存しました。${snap.placeEmbedding ? '\nDINOv2 Embeddingも保存しました。' : ''}`);
+    } else {
+      closeCamera(); await performVisualMatch(snap.descriptor, snap.placeEmbedding, { manual: true });
+    }
+  } catch (error) { alert(`撮影処理に失敗しました: ${error?.message || error}`); }
+}
+
+function visualCandidateScores(route, descriptor, placeEmbedding) {
+  const currentRel = currentRelativeHeading();
+  const prior = state.belief;
+  const out = [];
+  for (const cp of route.checkpoints || []) {
+    if (!cp.descriptor?.views) continue;
+    const hand = descriptorSimilarity(descriptor, cp.descriptor);
+    const stored = checkpointPlaceEmbedding(cp);
+    const neural = placeEmbedding && stored ? aiSimilarity(placeEmbedding, stored) : null;
+    const image = neural == null ? hand : 0.86 * neural + 0.14 * hand;
+    const heading = typeof cp.relHeading === 'number' ? 1 - clamp(angleDiff(cp.relHeading, currentRel) / 110, 0, 1) : 0.5;
+    const priorP = prior?.length ? prior[clamp(Math.round(cp.steps), 0, prior.length - 1)] : 0;
+    // Strongly visual, weakly temporal. This still allows recovery after a large dead-reckoning error.
+    const priorScore = priorP > 0 ? clamp(Math.log1p(priorP * prior.length * 3) / Math.log(4), 0, 1) : 0;
+    const score = 0.90 * image + 0.05 * heading + 0.05 * priorScore;
+    out.push({ cp, score, imageScore: image, neuralScore: neural, handScore: hand, priorScore });
+  }
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
+
+async function ensureRoutePlaceEmbeddings(route) {
+  if (state.ai.status !== 'ready') return false;
+  let changed = false;
+  for (const cp of route.checkpoints || []) {
+    if (!checkpointPlaceEmbedding(cp) && cp.blob instanceof Blob) {
+      try { const x = await ensureAIEmbedding(cp); if (x?.length) changed = true; } catch (_) {}
+    }
+  }
+  if (changed) await putRoute(route);
+  return changed;
+}
+
+async function performVisualMatch(descriptor, currentPlaceEmbedding = null, options = {}) {
+  if (!state.navRoute?.checkpoints?.length) {
+    if (options.manual) alert('このルートにはチェックポイント画像がありません。');
+    return null;
+  }
+  state.navRoute = await ensureCheckpointDescriptors(state.navRoute);
+  if (state.ai.status === 'ready') await ensureRoutePlaceEmbeddings(state.navRoute);
+  const candidates = visualCandidateScores(state.navRoute, descriptor, currentPlaceEmbedding);
+  const best = candidates[0], second = candidates[1];
+  if (!best) return null;
+  const margin = second ? best.score - second.score : 1;
+  const aiUsed = best.neuralScore != null;
+  const strong = best.score >= (aiUsed ? 0.82 : 0.75) && margin >= (aiUsed ? 0.025 : 0.035);
+  const acceptable = best.score >= (aiUsed ? 0.72 : 0.65) && margin >= 0.015;
+  const result = { ...best, second, margin, strong, acceptable, aiUsed };
+
+  if (options.manual) {
+    state.navCandidate = acceptable ? result : null;
+    $('matchResult').hidden = false;
+    $('matchScore').textContent = `一致 ${(best.score * 100).toFixed(0)}% / 候補差 ${(margin * 100).toFixed(1)}pt`;
+    $('matchScore').className = `match ${strong ? 'good' : acceptable ? 'weak' : 'bad'}`;
+    let detail = `最有力: ${best.cp.steps}歩地点。`;
+    if (aiUsed) detail += ` DINOv2 ${(best.neuralScore * 100).toFixed(0)}% + fallback特徴 ${(best.handScore * 100).toFixed(0)}%。`;
+    else detail += ` fallback特徴 ${(best.handScore * 100).toFixed(0)}%。DINOv2未使用。`;
+    detail += strong ? ' 強い観測です。' : acceptable ? ' 弱めの観測として利用可能です。' : ' 曖昧なので自動補正しません。';
+    if (second) detail += ` 第2候補: ${second.cp.steps}歩。`;
+    $('matchDetail').textContent = detail;
+    $('btnApplyMatch').hidden = !acceptable;
+  }
+  return result;
+}
+
+function applyVisualMatch() {
+  if (!state.navCandidate) return;
+  const r = state.navCandidate;
+  beliefObservePosition(r.cp.steps, r.strong ? 1.25 : 2.4, r.strong ? 8.0 : 3.0);
+  state.lastVisualCorrection = { at: Date.now(), steps: r.cp.steps, score: r.score, source: r.aiUsed ? 'DINOv2' : 'fallback' };
+  $('visualCorrectionLabel').textContent = `${r.cp.steps}歩 image観測`;
+  $('matchDetail').textContent += ' 確率分布へ反映しました。'; renderNav();
+}
+
+async function startAutoRelocCamera() {
+  if (!state.navActive || !$('autoRelocEnabled').checked || !state.navRoute?.checkpoints?.length) return;
+  stopAutoRelocCamera();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 360 } }, audio: false });
+    state.autoReloc.stream = stream; $('autoVideo').srcObject = stream;
+    state.autoReloc.enabled = true; state.autoReloc.lastScanAt = 0; state.autoReloc.lastScanSteps = -999;
+    $('autoRelocStatus').textContent = 'カメラ稼働中。低頻度で自動照合します。';
+    scheduleAutoReloc();
+  } catch (error) {
+    state.autoReloc.enabled = false;
+    $('autoRelocStatus').textContent = `自動カメラ開始失敗: ${error?.message || error}`;
+  }
+}
+
+function stopAutoRelocCamera() {
+  if (state.autoReloc.timer) { clearTimeout(state.autoReloc.timer); state.autoReloc.timer = null; }
+  if (state.autoReloc.stream) { state.autoReloc.stream.getTracks().forEach((t) => t.stop()); state.autoReloc.stream = null; }
+  if ($('autoVideo')) $('autoVideo').srcObject = null;
+  state.autoReloc.busy = false;
+}
+
+function scheduleAutoReloc() {
+  if (!state.navActive || !state.autoReloc.stream) return;
+  const sec = Number($('autoRelocInterval').value) || 8;
+  state.autoReloc.timer = setTimeout(runAutoRelocalization, sec * 1000);
+}
+
+async function runAutoRelocalization(force = false) {
+  if (state.autoReloc.timer) { clearTimeout(state.autoReloc.timer); state.autoReloc.timer = null; }
+  if (!state.navActive || !state.autoReloc.stream || state.measurementPaused || document.visibilityState !== 'visible') { scheduleAutoReloc(); return; }
+  if (state.autoReloc.busy) { scheduleAutoReloc(); return; }
+  const minSteps = Number($('autoRelocMinSteps').value) || 4;
+  if (!force && Math.abs(state.navRawSteps - state.autoReloc.lastScanSteps) < minSteps) { scheduleAutoReloc(); return; }
+  state.autoReloc.busy = true;
+  try {
+    $('autoRelocStatus').textContent = '画像照合中…';
+    const snap = await captureVideoFrameFrom($('autoVideo'), state.ai.status === 'ready' ? 448 : 320);
+    state.autoReloc.lastScanAt = Date.now(); state.autoReloc.lastScanSteps = state.navRawSteps;
+    const result = await performVisualMatch(snap.descriptor, snap.placeEmbedding, { manual: false });
+    if (!result) { $('autoRelocStatus').textContent = '比較候補なし'; return; }
+    const stats = beliefStats();
+    const distance = Math.abs(result.cp.steps - stats.map);
+    const farJump = distance > Math.max(10, state.navRoute.totalSteps * 0.22);
+    const uniqueEnough = result.margin >= (result.aiUsed ? 0.035 : 0.05);
+    const autoAccept = result.strong && uniqueEnough && (!farJump || (result.score >= V4_AUTO_VERY_STRONG && result.margin >= 0.06));
+    $('autoRelocLast').textContent = `最終照合: ${result.cp.steps}歩 ${(result.score * 100).toFixed(0)}% / Δ${(result.margin * 100).toFixed(1)}pt`;
+    if (autoAccept) {
+      beliefObservePosition(result.cp.steps, result.aiUsed ? 1.3 : 1.8, result.aiUsed ? 6.5 : 4.0);
+      state.lastVisualCorrection = { at: Date.now(), steps: result.cp.steps, score: result.score, source: result.aiUsed ? 'auto DINOv2' : 'auto fallback' };
+      state.autoReloc.lastAppliedAt = Date.now();
+      $('autoRelocStatus').textContent = `自動補正: ${result.cp.steps}歩地点`;
+      renderNav();
+    } else {
+      $('autoRelocStatus').textContent = farJump ? '候補は遠距離ジャンプのため保留' : '候補の一意性不足 → 補正保留';
+    }
+  } catch (error) {
+    $('autoRelocStatus').textContent = `自動照合失敗: ${error?.message || error}`;
+  } finally { state.autoReloc.busy = false; scheduleAutoReloc(); }
+}
+
+async function manualVisualReloc() {
+  if (state.autoReloc.stream && $('autoVideo').videoWidth > 2) {
+    await runAutoRelocalization(true);
+    return;
+  }
+  openCamera('visual-match');
+}
+
+async function startNavigation() {
+  if (!ensureSensorReadyForRoute()) return;
+  if (!state.navRoute) { alert('ルートを選択してください。'); return; }
+  state.navActive = true; state.navRawSteps = 0; state.navOffset = 0; state.navEstimateStep = 0; state.navEvents = []; state.navTurns = [];
+  state.navStartHeading = state.heading; state.navMatchedTurnIndex = 0; state.lastTurnCorrection = null; state.lastVisualCorrection = null; state.navCandidate = null;
+  state.measurementPaused = false;
+  resetDetectorTransient(); resetAdaptiveWalkingState(); resetGyroRouteFrame(); initBelief(state.navRoute, 0);
+  renderNavButtons(true); await requestWakeLock(); renderNav();
+  if ($('autoRelocEnabled').checked && state.navRoute.checkpoints?.length) await startAutoRelocCamera();
+}
+
+function stopNavigation() {
+  state.navActive = false; releaseWakeLock(); stopAutoRelocCamera(); renderNavButtons(false); renderNav();
+  $('autoRelocStatus').textContent = 'ナビ停止。';
+}
+
+function pauseMeasurement(reason) {
+  if (!(state.recording || state.navActive || state.calibrating)) return;
+  state.measurementPaused = true; releaseWakeLock();
+  if (state.navActive) stopAutoRelocCamera();
+  $('resumeReason').textContent = reason; $('resumeBanner').hidden = false;
+}
+
+async function resumeMeasurement() {
+  state.measurementPaused = false; resetDetectorTransient(); state.gyro.lastT = null;
+  $('resumeBanner').hidden = true; await requestWakeLock();
+  if (state.navActive && $('autoRelocEnabled').checked) await startAutoRelocCamera();
+}
+
+function routeHeadingAtStep(route, step) {
+  if (!route?.events?.length) return 0;
+  let best = route.events[0], err = Infinity;
+  for (const ev of route.events) {
+    const e = Math.abs((ev.steps ?? 0) - step);
+    if (e < err) { err = e; best = ev; }
+  }
+  return best?.gyroRelHeading ?? best?.relHeading ?? 0;
+}
+
+function renderNav() {
+  const route = state.navRoute;
+  const currentRel = state.navActive ? currentRelativeHeading() : null;
+  $('navRawSteps').textContent = String(state.navRawSteps);
+  $('navRelativeHeading').textContent = currentRel == null ? '--°' : `${currentRel.toFixed(0)}°`;
+  if (!route) {
+    $('navSteps').textContent = '0歩'; $('navProgressValue').textContent = '0%'; $('navProgressBar').style.width = '0%';
+    $('navRecordedHeading').textContent = '--°'; $('navHeadingDiff').textContent = '--°'; $('nextTurn').textContent = 'ルートを選択してください';
+    $('navConfidence').textContent = '--'; $('navConfidence').className = 'metric-value confidence-medium'; clearCanvas($('navCanvas')); drawBelief(); renderBeliefCandidates(); return;
+  }
+  if (!state.belief || state.beliefRouteId !== route.id) initBelief(route, 0);
+  const stats = beliefStats(); const estimate = clamp(stats.map, 0, route.totalSteps); state.navEstimateStep = estimate;
+  const progress = clamp(estimate / Math.max(1, route.totalSteps), 0, 1);
+  const expectedHeading = routeHeadingAtStep(route, estimate);
+  const headingDiff = currentRel == null ? null : angleDiff(expectedHeading, currentRel);
+  const confidence = confidenceForNav();
+  $('navSteps').textContent = `${Math.round(estimate)}歩`; $('navProgressValue').textContent = `${Math.round(progress * 100)}%`; $('navProgressBar').style.width = `${progress * 100}%`;
+  $('navRecordedHeading').textContent = `${expectedHeading.toFixed(0)}°`; $('navHeadingDiff').textContent = headingDiff == null ? '--°' : `${headingDiff.toFixed(0)}°`;
+  $('navConfidence').textContent = confidence.label; $('navConfidence').className = `metric-value ${confidence.cls}`;
+  $('turnCorrectionLabel').textContent = state.lastTurnCorrection ? `${state.lastTurnCorrection.target}歩 gyro観測` : 'なし';
+  $('visualCorrectionLabel').textContent = state.lastVisualCorrection ? `${state.lastVisualCorrection.steps}歩 ${state.lastVisualCorrection.source}` : 'なし';
+  const turn = nextRouteTurn(route, estimate);
+  $('nextTurn').textContent = progress >= 0.98 ? 'GOAL付近です' : turn ? `次の大きな方向変化まで約 ${Math.max(0, Math.round(turn.steps - estimate))} 歩` : 'この先に大きな方向変化はありません';
+  drawRoute($('navCanvas'), route, progress); drawBelief(); renderBeliefCandidates(); renderLive();
+}
+
+function checkpointPairSimilarity(a, b) {
+  const ai = aiSimilarity(checkpointPlaceEmbedding(a), checkpointPlaceEmbedding(b));
+  if (ai != null) return { score: ai, source: 'dinov2' };
+  if (a.descriptor && b.descriptor) return { score: descriptorSimilarity(a.descriptor, b.descriptor), source: 'descriptor' };
+  return { score: 0, source: 'none' };
+}
+
+function bestAndSecond(candidates) {
+  const sorted = [...candidates].sort((a, b) => b.score - a.score);
+  return { best: sorted[0] || null, second: sorted[1] || null };
+}
+
+function safeUnionFind(items) {
+  const parent = items.map((_, i) => i);
+  const routes = items.map((x) => new Set([x.routeId]));
+  const find = (x) => parent[x] === x ? x : (parent[x] = find(parent[x]));
+  const join = (a, b) => {
+    a = find(a); b = find(b); if (a === b) return true;
+    for (const r of routes[a]) if (routes[b].has(r)) return false;
+    parent[b] = a; for (const r of routes[b]) routes[a].add(r); return true;
+  };
+  return { parent, find, join };
+}
+
+function enforceOrderConsistency(matches) {
+  if (matches.length <= 1) return { keep: matches, rejected: [] };
+  const sorted = [...matches].sort((a, b) => a.a.step - b.a.step);
+  const first = sorted[0], last = sorted[sorted.length - 1];
+  const increasing = last.b.step >= first.b.step;
+  const keep = [], rejected = [];
+  let prev = increasing ? -Infinity : Infinity;
+  for (const m of sorted) {
+    const ok = increasing ? m.b.step > prev : m.b.step < prev;
+    if (ok) { keep.push(m); prev = m.b.step; } else rejected.push(m);
+  }
+  return { keep, rejected };
+}
+
+async function buildRouteGraph() {
+  const routes = (await getRoutes()).map(normalizeRoute);
+  const stats = { accepted: 0, rejectedMutual: 0, rejectedMargin: 0, rejectedOrder: 0, rejectedConflict: 0 };
+  if (!routes.length) { state.graph = { nodes: [], edges: [], builtAt: Date.now(), stats }; renderGraph(); return; }
+  $('graphStatus').textContent = '構築中…';
+  if (state.ai.status === 'ready') {
+    for (const route of routes) await ensureRoutePlaceEmbeddings(route);
+  }
+
+  const anchors = [];
+  for (const route of routes) {
+    const cps = [...(route.checkpoints || [])].sort((a, b) => a.steps - b.steps);
+    const ra = [];
+    const first = cps.find((cp) => cp.steps <= 3) || null;
+    const last = [...cps].reverse().find((cp) => cp.steps >= route.totalSteps - 3) || null;
+    ra.push({ routeId: route.id, routeName: route.name, step: 0, kind: 'start', cp: first, key: `${route.id}:start` });
+    for (const cp of cps) if (cp !== first && cp !== last) ra.push({ routeId: route.id, routeName: route.name, step: cp.steps, kind: 'checkpoint', cp, key: `${route.id}:${cp.id}` });
+    ra.push({ routeId: route.id, routeName: route.name, step: route.totalSteps, kind: 'goal', cp: last, key: `${route.id}:goal` });
+    anchors.push(...ra.sort((a, b) => a.step - b.step));
+  }
+
+  const acceptedPairs = [];
+  for (let ri = 0; ri < routes.length; ri += 1) {
+    for (let rj = ri + 1; rj < routes.length; rj += 1) {
+      const A = anchors.filter((x) => x.routeId === routes[ri].id && x.cp);
+      const B = anchors.filter((x) => x.routeId === routes[rj].id && x.cp);
+      if (!A.length || !B.length) continue;
+      const matrix = [];
+      for (let i = 0; i < A.length; i += 1) for (let j = 0; j < B.length; j += 1) {
+        const sim = checkpointPairSimilarity(A[i].cp, B[j].cp);
+        matrix.push({ i, j, a: A[i], b: B[j], score: sim.score, source: sim.source });
+      }
+      const provisional = [];
+      for (let i = 0; i < A.length; i += 1) {
+        const ai = bestAndSecond(matrix.filter((m) => m.i === i));
+        if (!ai.best) continue;
+        const bj = bestAndSecond(matrix.filter((m) => m.j === ai.best.j));
+        if (!bj.best || bj.best.i !== i) { stats.rejectedMutual += 1; continue; }
+        const threshold = ai.best.source === 'dinov2' ? V4_GRAPH_AI_THRESHOLD : V4_GRAPH_HAND_THRESHOLD;
+        const marginA = ai.best.score - (ai.second?.score ?? 0);
+        const marginB = bj.best.score - (bj.second?.score ?? 0);
+        const highSingle = ai.best.score >= threshold + 0.045;
+        const marginsOK = marginA >= 0.025 && marginB >= 0.025;
+        if (ai.best.score < threshold || (!marginsOK && !highSingle)) { stats.rejectedMargin += 1; continue; }
+        provisional.push(ai.best);
+      }
+      const ordered = enforceOrderConsistency(provisional);
+      stats.rejectedOrder += ordered.rejected.length;
+      acceptedPairs.push(...ordered.keep);
+    }
+  }
+
+  const uf = safeUnionFind(anchors);
+  const anchorIndex = new Map(anchors.map((a, i) => [a.key, i]));
+  for (const m of acceptedPairs.sort((a, b) => b.score - a.score)) {
+    const ia = anchorIndex.get(m.a.key), ib = anchorIndex.get(m.b.key);
+    if (!uf.join(ia, ib)) { stats.rejectedConflict += 1; continue; }
+    stats.accepted += 1;
+  }
+
+  const groups = new Map();
+  anchors.forEach((a, i) => { const root = uf.find(i); if (!groups.has(root)) groups.set(root, []); groups.get(root).push({ ...a, anchorIndex: i }); });
+  const nodes = [], anchorToNode = new Map(); let n = 1;
+  for (const members of groups.values()) {
+    const node = { id: `N${n++}`, members, label: members.length > 1 ? `共通地点 ${[...new Set(members.map((m) => m.routeName))].join(' / ')}` : `${members[0].routeName} ${members[0].kind === 'start' ? 'START' : members[0].kind === 'goal' ? 'GOAL' : `${members[0].step}歩`}` };
+    nodes.push(node); members.forEach((m) => anchorToNode.set(m.key, node.id));
+  }
+  const edges = [];
+  for (const route of routes) {
+    const ra = anchors.filter((a) => a.routeId === route.id).sort((a, b) => a.step - b.step);
+    for (let i = 0; i < ra.length - 1; i += 1) {
+      const from = anchorToNode.get(ra[i].key), to = anchorToNode.get(ra[i + 1].key);
+      if (!from || !to || from === to) continue;
+      edges.push({ id: `${route.id}:${i}`, from, to, cost: Math.max(1, ra[i + 1].step - ra[i].step), routeId: route.id, routeName: route.name, fromStep: ra[i].step, toStep: ra[i + 1].step });
+    }
+  }
+  state.graph = { nodes, edges, builtAt: Date.now(), ai: state.ai.status === 'ready', stats };
+  renderGraph();
+}
+
+function renderGraph() {
+  const graph = state.graph || { nodes: [], edges: [], stats: {} };
+  $('graphNodeCount').textContent = String(graph.nodes.length || 0); $('graphEdgeCount').textContent = String(graph.edges.length || 0);
+  $('graphStatus').textContent = graph.builtAt ? `${new Date(graph.builtAt).toLocaleTimeString('ja-JP')} 構築。${graph.ai ? 'DINOv2優先。' : '軽量特徴。'} MNN+順序整合で誤結合を抑制。` : '未構築。';
+  const s = graph.stats || {};
+  $('graphAccepted').textContent = String(s.accepted || 0); $('graphRejectedMutual').textContent = String(s.rejectedMutual || 0); $('graphRejectedMargin').textContent = String(s.rejectedMargin || 0); $('graphRejectedOrder').textContent = String(s.rejectedOrder || 0); $('graphRejectedConflict').textContent = String(s.rejectedConflict || 0);
+  const fill = (select) => { const prev = select.value; select.innerHTML = '<option value="">選択</option>'; for (const node of graph.nodes) { const o = document.createElement('option'); o.value = node.id; o.textContent = `${node.id}: ${node.label}`; select.appendChild(o); } if (graph.nodes.some((x) => x.id === prev)) select.value = prev; };
+  fill($('graphFrom')); fill($('graphTo'));
+  const list = $('graphNodesList'); list.innerHTML = '';
+  for (const node of graph.nodes) {
+    const el = document.createElement('div'); el.className = 'graph-node';
+    const members = node.members.map((m) => `${m.routeName} @ ${m.step}歩${m.cp ? ' 📷' : ''}`).join('<br>');
+    el.innerHTML = `<div class="graph-node-title">${node.id}: ${node.label}</div><div class="graph-node-meta">${node.members.length} anchor(s)</div><div class="graph-members">${members}</div>`; list.appendChild(el);
+  }
+  if (!graph.nodes.length) list.innerHTML = '<div class="card"><div class="note">グラフはまだありません。</div></div>';
+}
+
+function renderTechCapabilities() {
+  const set = (id, ok, yes, no = '未対応') => { if (!$(id)) return; $(id).textContent = ok ? yes : no; $(id).className = ok ? 'cap-ok' : 'cap-warn'; };
+  set('capSecure', window.isSecureContext, 'HTTPS / secure');
+  set('capMotion', 'DeviceMotionEvent' in window, '利用可能');
+  set('capGyro', state.gyro.available, state.gyro.source, '未確認（センサー許可後に判定）');
+  set('capCamera', !!navigator.mediaDevices?.getUserMedia, '利用可能');
+  set('capIndexedDB', 'indexedDB' in window, '利用可能');
+  set('capWakeLock', 'wakeLock' in navigator, '利用可能');
+  set('capWebGPU', !!navigator.gpu, '利用可能');
+  if ($('capAIBackend')) $('capAIBackend').textContent = state.ai.status === 'ready' ? `${V4_PLACE_MODEL_LABEL} / ${state.ai.backend}` : state.ai.status === 'error' ? 'AI fallback中' : '未読み込み';
+}
+
+function switchView(name) {
+  document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  $(`view-${name}`).classList.add('active');
+  if (name === 'routes') refreshRoutes();
+  if (name === 'nav') renderNav();
+  if (name === 'graph') renderGraph();
+  if (name === 'tech') renderTechCapabilities();
+  window.scrollTo({ top: 0, behavior: 'instant' });
+}
+
+function bindUI() {
+  document.querySelectorAll('nav button').forEach((button) => { button.onclick = () => switchView(button.dataset.view); });
+  $('btnPermission').onclick = requestSensors;
+  $('btnCalibration').onclick = toggleCalibration; $('btnResetCalibration').onclick = resetCalibration;
+  $('threshold').value = String(state.detector.threshold); $('thresholdLabel').textContent = state.detector.threshold.toFixed(2);
+  $('threshold').oninput = () => { state.detector.threshold = parseFloat($('threshold').value); localStorage.setItem('visualRoute.stepThreshold', String(state.detector.threshold)); $('thresholdLabel').textContent = state.detector.threshold.toFixed(2); state.stepAdaptive.effectiveThreshold = state.detector.threshold; };
+  $('btnStartRecord').onclick = startRecording; $('btnCapture').onclick = captureCamera; $('btnCloseCamera').onclick = closeCamera;
+  $('btnStartNav').onclick = startNavigation; $('btnVisualMatch').onclick = manualVisualReloc; $('btnApplyMatch').onclick = applyVisualMatch;
+  $('navRouteSelect').onchange = () => loadNavRoute($('navRouteSelect').value);
+  $('btnResumeMeasurement').onclick = resumeMeasurement;
+  $('btnExport').onclick = exportBackup; $('btnImport').onclick = () => $('importFile').click();
+  $('importFile').onchange = async () => { const file = $('importFile').files?.[0]; if (file) await importBackup(file); $('importFile').value = ''; };
+  $('btnLoadAI').onclick = () => loadAIModel().catch(() => {}); $('btnLoadAIGraph').onclick = () => loadAIModel().then(renderGraph).catch(() => {});
+  $('btnBuildGraph').onclick = () => buildRouteGraph().catch((e) => { $('graphStatus').textContent = `構築エラー: ${e?.message || e}`; }); $('btnGraphPath').onclick = calculateGraphPathUI;
+  $('autoRelocEnabled').onchange = async () => { if (!state.navActive) return; if ($('autoRelocEnabled').checked) await startAutoRelocCamera(); else { stopAutoRelocCamera(); $('autoRelocStatus').textContent = '自動補正OFF'; } };
+  document.addEventListener('visibilitychange', handleVisibility);
+  window.addEventListener('pagehide', () => pauseMeasurement('ページが非表示になりました。戻ったら「計測を再開」を押してください。'));
+  window.addEventListener('resize', () => drawBelief());
+}
+
+async function init() {
+  bindUI();
+  if (!window.isSecureContext) $('secureWarning').hidden = false;
+  if ('serviceWorker' in navigator && window.isSecureContext) navigator.serviceWorker.register('./sw.js?v=4.0.0').catch(() => {});
+  setInterval(() => { if (state.recording) renderLive(); }, 500);
+  try { await openDB(); await refreshRoutes(); } catch (error) { console.error(error); }
+  renderAIStatus(); renderLive(); renderNav(); renderCompassQuality(); renderGraph(); renderTechCapabilities();
+}
+
+/* V4 consistency hotfixes */
+function normalizeRoute(route) {
+  const r = { ...route };
+  r.schemaVersion = r.schemaVersion || 1;
+  r.strideM = r.strideM || STRIDE_M;
+  r.events = Array.isArray(r.events) ? r.events.map((e) => ({ ...e })) : [];
+  const firstHeading = r.startHeading ?? r.events.find((e) => typeof e.heading === 'number')?.heading ?? 0;
+  for (const e of r.events) {
+    if (typeof e.relHeading !== 'number') e.relHeading = typeof e.heading === 'number' ? signedAngle(firstHeading, e.heading) : 0;
+    if (typeof e.gyroRelHeading !== 'number' && r.schemaVersion >= 4) e.gyroRelHeading = e.relHeading;
+  }
+  // Preserve real-time gyro turns recorded by v4; reconstruct only for older schemas or missing data.
+  r.turns = Array.isArray(route.turns) && route.turns.length && r.schemaVersion >= 4
+    ? route.turns.map((t) => ({ ...t }))
+    : detectTurns(r.events);
+  r.checkpoints = Array.isArray(r.checkpoints) ? r.checkpoints.map((cp) => {
+    const next = { ...cp };
+    if (typeof next.relHeading !== 'number') next.relHeading = typeof next.heading === 'number' ? signedAngle(firstHeading, next.heading) : null;
+    return next;
+  }) : [];
+  return r;
+}
+
+async function toggleCalibration() {
+  if (!state.sensorGranted) { alert('先に「センサーを許可」を押してください。'); return; }
+  if (state.recording || state.navActive) { alert('ルート記録/ナビ中はキャリブレーションできません。'); return; }
+  if (!state.calibrating) {
+    state.calibrating = true; state.calibrationSamples = []; resetDetectorTransient(); resetAdaptiveWalkingState();
+    $('btnCalibration').textContent = '20歩終わった → 調整する';
+    $('calibrationResult').textContent = '普段の持ち方で、正確に20歩歩いてからこのボタンをもう一度押してください。';
+    await requestWakeLock(); return;
+  }
+  state.calibrating = false; releaseWakeLock();
+  if (state.calibrationSamples.length < 30) {
+    $('calibrationResult').textContent = 'データが少なすぎます。もう一度20歩歩いてください。';
+    $('btnCalibration').textContent = '20歩キャリブレーション'; return;
+  }
+  const result = chooseThresholdForTarget(state.calibrationSamples, 20);
+  state.detector.threshold = result.threshold; state.stepAdaptive.effectiveThreshold = result.threshold;
+  localStorage.setItem('visualRoute.stepThreshold', String(result.threshold));
+  $('threshold').value = String(result.threshold); $('thresholdLabel').textContent = result.threshold.toFixed(2);
+  $('calibrationResult').textContent = `基準値: ${result.threshold.toFixed(2)} m/s²（キャリブレーションデータでは${result.count}歩）。歩行中はV4適応しきい値が自動追従します。`;
+  $('btnCalibration').textContent = '20歩キャリブレーション'; resetDetectorTransient(); resetAdaptiveWalkingState(); renderLive();
+}
+
+function resetCalibration() {
+  state.detector.threshold = DEFAULT_THRESHOLD; state.stepAdaptive.effectiveThreshold = DEFAULT_THRESHOLD;
+  localStorage.removeItem('visualRoute.stepThreshold'); $('threshold').value = String(DEFAULT_THRESHOLD); $('thresholdLabel').textContent = DEFAULT_THRESHOLD.toFixed(2);
+  $('calibrationResult').textContent = '基準値を初期値へ戻しました。'; resetAdaptiveWalkingState(); renderLive();
+}
+
+function renderNavButtons(active) {
+  $('navButtons').innerHTML = active
+    ? '<button id="btnStopNav" class="btn danger">ナビ停止</button><button id="btnVisualMatch" class="btn secondary">画像で現在地点を補正</button>'
+    : '<button id="btnStartNav" class="btn">同じSTART地点からナビ開始</button><button id="btnVisualMatch" class="btn secondary">画像で現在地点を補正</button>';
+  if (active) $('btnStopNav').onclick = stopNavigation; else $('btnStartNav').onclick = startNavigation;
+  // Manual mode opens the aiming view even when automatic relocalization is active.
+  $('btnVisualMatch').onclick = () => openCamera('visual-match');
 }
 
 init();

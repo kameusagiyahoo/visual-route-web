@@ -1,34 +1,34 @@
-# CHANGELOG — v3.0.0
+# CHANGELOG — v4.0.0
 
-## 追加
+## 対応した課題
 
-- HMM型ベイズルートフィルタ
-- 位置確率分布Canvas
-- 確率分布から信頼度を算出
-- 歩数観測の確率遷移
-- 相対方角の尤度更新
-- 曲がり角の位置尤度更新
-- 画像一致の位置尤度更新
-- TensorFlow.jsの遅延読み込み
-- MobileNetV2 α0.25の画像Embedding
-- V2画像特徴とのハイブリッド照合
-- AIロード失敗時の自動フォールバック
-- 複数ルートのTopological Graph生成
-- チェックポイント画像による共通Nodeクラスタリング
-- Dijkstra最短経路
-- V1/V2ルート互換
+1. 歩数誤差
+   - 固定threshold中心からAdaptive Step Detectorへ変更。
+   - rolling MAD、recent peak amplitude、cadence consistencyを利用。
 
-## 設計変更
+2. 曲がり角の磁気依存
+   - rotationRateとgravity vectorからworld-vertical yaw proxyを算出。
+   - turn detectionはgyro主体、compassはdrift補助。
 
-V2:
-`歩数 + offset補正 → 1つの推定地点`
+3. 分類モデルEmbedding
+   - MobileNetV2からDINOv2-small image-feature-extractionへ変更。
+   - Place model adapterとして独立させた。
 
-V3:
-`全地点の確率分布 → 歩数/方角/turn/imageでBayes更新 → MAP地点`
+4. 手動画像補正
+   - ナビ中の自動再ローカライズを追加。
+   - interval/minimum steps/遠距離jump guardを実装。
 
-これにより、画像が曖昧な場合でも即座に1地点へ飛ばず、過去の位置履歴を保持したまま補正できます。
+5. Graph誤結合
+   - Mutual nearest neighbor。
+   - best-second margin。
+   - route順序整合。
+   - same-route cluster conflict禁止。
 
-## AI backendについて
+6. 技術スタックの可視化
+   - 専用「技術」タブを追加。
+   - Runtime / Browser APIs / algorithms / AI / privacy / live capabilityを表示。
 
-当初のWebGPU案から、iPhone Safariの安定性を優先してV3のMobileNet推論はTensorFlow.js WebGLを使用します。
-WebGPU availability自体は表示します。
+## 互換性
+
+V1〜V3のIndexedDBルートを読み込み可能です。
+旧checkpointにはDINOv2 embeddingがないため、モデル読込時に必要に応じて遅延生成します。
